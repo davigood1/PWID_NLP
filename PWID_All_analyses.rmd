@@ -1,0 +1,2456 @@
+```{r Library}
+library(pacman)
+p_load(tidyverse, tidylog, gdata, lubridate, MatchIt, skimr, kableExtra, flextable, gtsummary, colorspace, tictoc)
+#install.packages("P:/ORD_Goodman_201909071D/Upload/parsnip_0.2.1.zip", repo = NULL,
+#lib = "P:/ORD_Goodman_201909071D/Upload/" )
+#install.packages("P:/ORD_Goodman_201909071D/Upload/rlang_1.0.2.zip", repo = NULL,
+#                 lib = "P:/ORD_Goodman_201909071D/Upload/" )
+#library(parsnip, lib.loc = "P:/ORD_Goodman_201909071D/Upload/" )
+#library(rlang, lib.loc = "P:/ORD_Goodman_201909071D/Upload/" )
+p_load(tidytext, textrecipes, textclean, stringr)
+#p_load(tidymodels, parsnip, naivebayes, ranger, xgboost, 
+#       kernlab, kknn, keras, workflowsets, themis, stacks, vip) #Models
+
+library(tidymodels)
+library(parsnip)
+library(naivebayes)
+library(ranger)
+library(xgboost)
+library(kernlab)
+library(kknn)
+library(keras)
+library(workflowsets)
+library(themis)
+library(stacks)
+library(vip)
+#library(discrim)
+
+p_load(furrr)
+plan(multisession, workers = 4)
+p_load(plotROC, cvms)
+
+#set up custom options
+options(scipen = 999)
+set.seed(100)
+theme_set(theme_minimal())
+
+
+```
+
+```{r Descriptives}
+#Import data with all cases 36k
+df <- read.csv("DATA/DF_DrugPositive.csv")
+
+#Data wrangle
+df$DrugPositive <- recode(df$DrugPositive, NULL = 0, `0` = 0, `1` = 1)
+df$Admit.Year <- year(df$Acute_AdmitDateTime)
+df$Admit.Year <- as.factor(df$Admit.Year)
+df$Age_admission <- as.numeric(df$Age_admission)
+df$Gender <- recode(df$Gender, `M` = "Male", `F` = "Female", `NULL` = "Male")
+df$Ethnicity <- recode(df$Ethnicity, 
+                       "DECLINED TO ANSWER" = "Unknown", 
+                       "HISPANIC OR LATINO" = "Latino",
+                       "NOT HISPANIC OR LATINO" = "Not Latino", 
+                       "NULL" = "Unknown",
+                       "UNKNOWN BY PATIENT" = "Unknown")
+df$Race <- recode(df$Race,
+                  "AMERICAN INDIAN OR ALASKA NATIVE" ="AIAN",
+                  "ASIAN" = "Asian",
+                  "BLACK OR AFRICAN AMERICAN" = "Black",
+                  "DECLINED TO ANSWER" = "Unknown",
+                  "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER"= "NHPI",
+                  "NULL" = "Unknown",                                     
+                  "UNKNOWN BY PATIENT" = "Unknown",
+                  "WHITE" = "White")
+
+#Add districts
+va.location <- read.csv('Sta3n_VA_location.csv')
+colnames(va.location)[1] <- "Sta3n"
+va.location$Sta3n <- as.character(va.location$Sta3n)
+df <- df %>% left_join(va.location %>% select(Sta3n, Sta3nName, DistrictNameFY16, City), by="Sta3n")
+colnames(df)[28] <- "District"
+df$District <- recode(df$District,
+                  	"MidWest" = "Midwest",
+			"Midwest" =  "Midwest",
+			"Continental" = "Continental", 
+			"North Atlantic" = "North Atlantic", 
+			"Southeast" =  "Southeast",      
+			"Pacific" = "Pacific" )
+
+saveRDS(df, "PWID_NLP/Data/df_descriptive.rds")
+
+#Statistics for entire cohort
+tbl.master <- df %>% select(Age = Age_admission, Gender, Race, Ethnicity, District) %>%
+	tbl_summary(
+		sort = all_categorical() ~ "frequency") %>%
+	as_flex_table()  %>%
+	set_table_properties(layout = "autofit")
+
+#Import annotated dataset
+df.pwid.neg <- readRDS("Data/df_pwid_final.RDS")
+df.pwid.neg <- df.pwid.neg %>% 
+  mutate(IVDU = ifelse(IVDU == 0, "Non-IVDU", IVDU),
+         IVDU = ifelse(IVDU == 1, "IVDU", IVDU)) %>%
+  mutate(IVDU = as.factor(IVDU))
+
+#Import annotations
+df.annotation.s <- read.csv("Data/df_annotations.csv")
+
+df.substance <- df.annotation.s %>% filter(FeatureName == "Type")
+df.substance <- df.substance %>% 
+	mutate(Values = 1) %>%
+	pivot_wider(
+		id_cols = c("PatientSID", "TIUDocumentSID"),
+		names_from = OptionName,
+		values_from = Values,
+		values_fill = 0,
+		values_fn = max)
+
+df.pwid.neg <- df.pwid.neg %>% 
+		left_join(df.substance,
+			by = c("PatientSID", "TIUDocumentSID"))
+df.pwid.neg <- df.pwid.neg %>% 
+	mutate(across(`Cocaine or crack`:Benzodiazepine, ~replace_na(., 0)))
+```
+
+```{r Split }
+#Train/test split
+df_split <- initial_split(data = df.pwid.neg, prop = .70, strata = IVDU)
+train <- training(df_split)
+test <- testing(df_split)
+
+#Create indicator for testing or training dataset
+df.pwid.neg <- df.pwid.neg %>%
+	left_join(train %>% select(PatientSID, TIUDocumentSID) %>% mutate(Split = "Train"),
+			by = c("PatientSID", "TIUDocumentSID"))
+df.pwid.neg <- df.pwid.neg %>% mutate(Split = replace_na(Split, "Test"))
+df.pwid.neg$Split <- factor(df.pwid.neg$Split, levels = c("Train", "Test"))
+
+#Statistics for annotated cohort
+##Merge demographic data from master dataset
+df.pwid <- df.pwid.neg %>% select(PatientSID, IVDU, Split,  
+					`Cocaine or crack`, Heroin, `Methamphetamine/amphetamine`, 
+					`Prescription opioid`, `Cannabis/marijuana`, Benzodiazepine) %>% 
+			left_join(df, by = "PatientSID")
+
+##Make table
+tbl.pwid <- df.pwid %>% select(Split, Age = Age_admission, Gender, Race, Ethnicity, District, IVDU,
+					`Cocaine or crack`, Heroin, `Methamphetamine/amphetamine`, 
+					`Prescription opioid`, `Cannabis/marijuana`, Benzodiazepine
+) %>%
+	tbl_summary(
+		by = Split,
+		sort = all_categorical() ~ "frequency") %>%
+	add_overall() %>%
+	add_p() %>%
+	as_flex_table() %>%
+	set_table_properties(layout = "autofit")
+
+
+#Text descriptives
+#Tables
+##Number of cases per county
+df.text <- df.pwid.neg
+
+##Descriptives for text
+###Number of characters
+tbl.char.summary <- flextable(df.text %>% 
+  summarize( Min = min(nchar(text)),
+             Q1 = quantile(nchar(text), .25),
+             Mean = mean(nchar(text)), 
+             Median = median(nchar(text)), 
+             Q3 = quantile(nchar(text), .75),
+             Max = max(nchar(text))
+             ) 
+)
+
+###Number of words
+tbl.word.summary <- flextable(df.text %>% mutate(nword = str_count(text, '\\w+')) %>%
+  summarize( Min = min(nword),
+             Q1 = quantile(nword, .25),
+             Mean = mean(nword), 
+             Median = median(nword), 
+             Q3 = quantile(nword, .75),
+             Max = max(nword)
+             )
+)
+
+#Frequencies
+p.histogram.char <- df.text %>%
+  ggplot(aes(nchar(text))) +
+  geom_histogram(binwidth = 50, alpha = 0.8, fill = "maroon") +
+  labs(x = "Number of characters per text",
+       y = "Number of texts") + 
+  theme_minimal()
+
+p.histogram.word <- df.text  %>% mutate(nword = str_count(text, '\\w+')) %>%
+  ggplot(aes(nword)) +
+  geom_histogram(binwidth = 50, alpha = 0.8, fill = "navy blue") +
+  labs(x = "Number of words per text",
+       y = "Number of texts") + 
+  theme_minimal()
+
+texts <- as_tibble(df.text) %>% 
+  mutate(document = row_number()) %>% 
+  select(text)
+
+tidy_texts <- texts %>%
+  unnest_tokens(word, text) %>%
+  group_by(word) %>%
+  filter(n() > 10) %>%
+  ungroup()
+
+#Remove stop words
+stopword <- as_tibble(stopwords::stopwords("en")) 
+stopword <- rename(stopword, word=value)
+tb <- anti_join(tidy_texts, stopword, by = 'word')
+
+#Frequencies
+p.frequent.words <- tb %>%
+  count(word, sort = TRUE) %>%
+	mutate(char = nchar(word)) %>%
+  filter(n > 1000) %>% 
+  filter(char > 1) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col(fill = "forest green") +
+  xlab(NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  coord_flip() +
+  theme_classic(base_size = 12) +
+  labs(title="Word frequency", subtitle="n > 1000")+
+  theme(plot.title = element_text(lineheight=.8, face="bold")) +
+  scale_fill_brewer() 
+```
+
+```{r Export descriptive tables}
+#Final tables/plots
+tables.list <- list(tbl.master, tbl.pwid, tbl.char.summary, tbl.word.summary)
+
+# write function
+
+p_load(officer, flextable)
+write_word_table <- function(var, doc){
+  doc %>%
+    body_add_flextable(var) %>% 
+    body_add_break() }
+
+write_word_plot <- function(var, doc){
+  doc %>%
+    body_add_gg(var, style = "centered", height = 6, width = 8) %>% 
+    body_end_section_landscape()
+    }
+# list of tables and the doc
+my_doc1 <- officer::read_docx()
+
+# use walk (the invisible function of map) to include all tables in one doc
+walk(tables.list, write_word_table, my_doc1)
+
+# add plots
+write_word_plot(p.histogram.char, my_doc1) 
+write_word_plot(p.histogram.word, my_doc1) 
+write_word_plot(p.frequent.words, my_doc1) 
+
+#Create word doc
+print(my_doc1, target = paste0("Tables/NLP_tables_demographics_", Sys.Date(), ".docx")) %>% invisible()
+```
+
+### Analysis 1 - TF-IDF without negation
+
+```{r Set up models}
+#Set-up specs for classifiers
+log_spec <- logistic_reg() %>% 
+  set_engine(engine = "glm") %>% 
+  set_mode("classification") 
+#nb_spec <- naive_Bayes(smoothness = tune()) %>% 
+#  set_mode("classification") %>% 
+#  set_engine("naivebayes")
+rf_spec <- rand_forest(min_n = tune(), trees = tune(), mtry  = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+xgb_spec <- boost_tree(trees = tune(), tree_depth = tune(), mtry  = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification") 
+svm_spec <- svm_linear(cost = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+```
+
+
+```{r Set up workflows}
+#Set-up recipe
+rec <- recipe(IVDU ~ text, data = train)
+
+rec_uni <- rec %>%
+  update_role(text, new_role = "predictor") %>%
+  update_role(IVDU, new_role = "outcome") %>%
+  step_tokenize(text) %>%
+  step_stopwords(text) %>%
+  step_tokenfilter(text, min_times = 10, max_tokens = Inf) %>%
+  step_tfidf(text)
+
+rec_bi <- rec %>%
+  update_role(text, new_role = "predictor") %>%
+  update_role(IVDU, new_role = "outcome") %>%
+  step_tokenize(text) %>%
+  step_stopwords(text) %>%
+  step_ngram(text,  num_tokens = 2, min_num_tokens = 1) %>%
+  step_tokenfilter(text, min_times = 10, max_tokens = Inf) %>%
+  step_tfidf(text)
+
+rec_tri <- rec %>%
+  update_role(text, new_role = "predictor") %>%
+  update_role(IVDU, new_role = "outcome") %>%
+  step_tokenize(text) %>%
+  step_stopwords(text) %>%
+  step_ngram(text,  num_tokens = 3, min_num_tokens = 1) %>%
+  step_tokenfilter(text, min_times = 10, max_tokens = Inf) %>%
+  step_tfidf(text)
+
+#Set-up workflow
+wflw_set <- workflow_set(
+  preproc = list(unigram = rec_uni, bigram = rec_bi, trigram = rec_tri), 
+  models = list(XGBoost = xgb_spec,
+                Logistic.regression = log_spec, 
+                #Naive.Bayes = nb_spec, 
+                Random.forest = rf_spec,
+                KNN = knn_spec, 
+                SVM = svm_spec))
+
+#Set up parameter tunning
+grid_ctrl <- control_grid(
+  save_pred = TRUE,
+  parallel_over = "everything",
+  save_workflow = F
+)
+
+#Set up parallel processing
+parallel::detectCores()
+p_load(doParallel)
+cl <- makePSOCKcluster(8)
+registerDoParallel(cl)
+
+#Cross validation
+cv_folds <- vfold_cv(train, v = 10, strata = IVDU)
+```
+
+```{r Train model}
+#Fit model
+grid_results <- wflw_set %>%
+  workflow_map(
+    seed = 100,
+    resamples = cv_folds,
+    grid = 10,
+    control = grid_ctrl,
+    metrics = metric_set(recall, precision, f_meas, accuracy, kap, roc_auc, pr_auc, sens, spec, ppv, npv),
+    verbose = T
+  )
+
+saveRDS(grid_results, paste0("Output/grid_results_", Sys.Date(), "tfidf.RDS"))
+
+#grid_results <- readRDS("Output/grid_results_2022-04-24tfidf.RDS")
+
+models.list <- c("Logistic regression", "Random forest", "XGBoost", "KNN", "SVM") 
+recipe.model.list <- c("unigram_Logistic.regression", "unigram_Random.forest", 
+                       "unigram_XGBoost", "unigram_KNN",  "unigram_SVM",
+                       "bigram_Logistic.regression","bigram_Random.forest", 
+                       "bigram_XGBoost", "bigram_KNN",  "bigram_SVM",
+                       "trigram_Logistic.regression", "trigram_Random.forest", 
+                       "trigram_XGBoost", "trigram_KNN",  "trigram_SVM") 
+
+#Create table with all results
+results.list <- map2(recipe.model.list, recipe.model.list, 
+                     ~ {
+                       extract_workflow_set_result(grid_results, id = .x) %>% 
+                         collect_metrics() %>% 
+                         mutate(outcome = "IVDU", model = .x)
+                     }
+)
+
+results.tbl.w <- bind_rows(results.list) %>% pivot_wider(
+  id_cols = c(.config, outcome, model),
+  names_from = .metric,
+  values_from = mean
+)
+
+#Summary statistics
+statistic.plot.list <-  grid_results %>% 
+  autoplot() + 
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Metrics",
+       subtitle = "Predict IVDU in EHR notes") +
+  theme_minimal()
+
+
+statistic.best.plot.list <- grid_results %>% 
+  autoplot(select_best = TRUE) + 
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Metrics",
+       subtitle = "Predict IVDU in EHR notes") +
+  theme_minimal()
+
+
+#Rank models
+rank_res <- rank_results(grid_results, 
+                         rank_metric = "f_meas", 
+                         select_best = TRUE) 
+
+rank_res.w <- rank_res %>%
+  pivot_wider(
+    id_cols = c("wflow_id"),
+    names_from = ".metric",
+    values_from = "mean"
+  )
+
+
+rank_res.table <- rank_res %>% 
+  filter(.metric == "f_meas")
+
+rank_res.table <- bind_rows(rank_res.table) %>% mutate(outcome = "IVDU")
+
+#Create table for word
+table.train.all.ranked <- flextable::flextable(rank_res.table %>% 
+                                                 mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+                                                 select(`Model` = model, 
+                                                        `Mean\nF-score` = mean, SE = std_err)) %>%
+  set_caption(caption =  "Table. F-score in 10-fold cross validation of training dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.train.all.ranked
+
+table.train.all.ranked.all.stats <- flextable::flextable(
+  rank_res.w %>%
+    mutate(across(where(is.numeric), ~round(.x, 3)))) %>%
+  set_caption(caption =  "Table. Mean 10-fold cross validation metrics of training dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.train.all.ranked.all.stats
+
+
+#Create ROC curves by model/outcome
+roc.list <- grid_results %>% 
+  collect_predictions() %>%
+  group_by(model) %>%
+  roc_curve(truth = IVDU, estimate = .pred_IVDU) %>%
+  autoplot() +
+  labs(
+    title = "Receiver operator curve - Training",
+    subtitle = "Predict IVDU in EHR data")
+
+
+#Create PR curve by model/outcome
+pr.list <- grid_results %>% 
+  collect_predictions() %>%
+  group_by(model) %>%
+  pr_curve(truth = IVDU, .pred_IVDU) %>%
+  autoplot() +
+  labs(
+    title = "Precision-recall curve - Training",
+    subtitle =  "Predict IVDU in EHR data")
+
+#Table of best models
+best_results.table <- rank_res %>% filter(.metric == "f_meas" & rank < 4)
+best_results.table <- bind_rows(best_results.table)
+
+#Create table for word
+table.train.best <- flextable::flextable(best_results.table %>% mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+                                           select(`Model` = model, 
+                                                  `Mean\nF-score` = mean, SE = std_err)) %>%
+  set_caption(caption =  "Table. Best performing models in 10-fold cross validation of training dataset") %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.train.best
+
+#Select best model
+best_results.list <- grid_results %>% 
+  extract_workflow_set_result(rank_res$wflow_id[1]) %>% 
+  select_best(metric = "f_meas") %>% mutate(outcome = "IVDU")
+
+
+#Fit on test data
+p_load(tictoc)
+tic()
+test_results <- grid_results %>% 
+  extract_workflow(rank_res$wflow_id[1]) %>% 
+  finalize_workflow(best_results.list) %>% 
+  last_fit(split = df_split, 
+           metrics = metric_set(f_meas, accuracy, kap, roc_auc, pr_auc, sens, spec, ppv, npv)) 
+time.testing <- toc()
+
+#Save/Load to local harddrive
+saveRDS(test_results, paste0("Output/test_results", as.character(Sys.Date()), "_tfidf.rds"))
+#test_results <- readRDS("Output/test_results2022-04-24_tfidf.rds")
+
+#Table for test results
+test_results.tbl <- test_results %>% collect_metrics() %>% mutate(outcome = "IVDU")
+test_results.tbl <- test_results.tbl %>% mutate(Metric = case_when(
+  .metric == "f_meas" ~ "F-score", 
+  .metric == "accuracy"  ~ "Accuracy",
+  .metric == "kap"~ "Kappa",
+  .metric == "sens" ~ "Sensitivity/Recall",
+  .metric == "spec" ~ "Specificity",
+  .metric == "ppv" ~ "Positive predictive value/Precision",
+  .metric == "npv" ~ "Negative predictive value",
+  .metric == "roc_auc" ~ "AUROC",
+  .metric == "pr_auc" ~ "AUPRC"
+))
+
+#Create table for word
+table.test <- flextable::flextable(test_results.tbl %>% mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+                                     select(Metric, Estimate = .estimate)) %>%
+  set_caption(caption =  "Table. Diagnostic metrics of best performing models in test dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.test
+
+
+test_fitted <- test_results$.workflow[[1]]
+
+test_fitted %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+
+```{r Error analysis}
+#Confusion matrix by model/outcome
+test_CM_table <- test_results %>% 
+  collect_predictions() %>% 
+  conf_mat(IVDU, .pred_class)  %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion matrix - Test set"
+  )
+
+#Error analysis from test set
+error_analysis <- test_results$.predictions[[1]] %>% #filter(.data[[.y]] != .pred_class) %>% 
+  mutate(Error = ifelse(IVDU != .pred_class,1,0))
+
+
+error_analysis_text <- error_analysis %>% left_join(df.pwid %>% mutate(.row = row_number()) %>% select(.row, text), by = ".row")
+
+
+#Save excel file with one df per sheet
+p_load(openxlsx)
+openxlsx::write.xlsx(error_analysis_text, paste0("Error/error_analysis_df_tfidf", Sys.Date(), "tfidf.xlsx"))
+
+error_analysis_all_data <- error_analysis %>% left_join(df.pwid.neg %>% mutate(.row = row_number()), by = ".row")
+```
+
+```{r Bootstrapping}
+#Confidence intervals
+boot_test <- bootstraps(test, times = 1000, apparent = TRUE, strata = IVDU)
+
+
+tic()
+bootstrap_results <- grid_results %>% 
+   extract_workflow(rank_res$wflow_id[1]) %>% 
+   finalize_workflow(best_results.list) %>% 
+   fit_resamples(resamples = boot_test,
+            metrics = metric_set(recall, precision, f_meas, accuracy, kap, roc_auc, pr_auc, sens, yardstick::spec, ppv, npv),
+            control = control_resamples(verbose = T,
+                                   save_pred = T,
+                                   parallel_over = "everything")) 
+time.bootstrap <- toc()
+
+#Save/Load to local harddrive
+saveRDS(bootstrap_results, 
+        paste0("Output/bootstrap_results", as.character(Sys.Date()),"_tfidf.rds"))
+
+#bootstrap_results <- readRDS("Output/bootstrap_results2022-05-05_tfidf.rds")
+
+
+#Tables
+bootstrap_CI_results <- bootstrap_results %>% collect_metrics(summarize = FALSE) %>%
+  group_by(.metric) %>% 
+  summarize(mean = mean(.estimate, na.rm = T),
+            CI.lower = quantile(.estimate, probs = c(0.025), na.rm = T),
+            CI.upper = quantile(.estimate, probs = c(0.975), na.rm = T)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  mutate(outcome = "IVDU", 
+         `95% CI` = paste0(CI.lower, " - ", CI.upper),
+         Metric = case_when(
+           .metric == "f_meas" ~ "F-score", 
+           .metric == "accuracy"  ~ "Accuracy",
+           .metric == "kap"~ "Kappa",
+           .metric == "sens" ~ "Sensitivity/Recall",
+           .metric == "spec" ~ "Specificity",
+           .metric == "ppv" ~ "Positive predictive value/Precision",
+           .metric == "npv" ~ "Negative predictive value",
+           .metric == "roc_auc" ~ "AUROC",
+           .metric == "pr_auc" ~ "AUPRC",
+           .metric == "recall" ~ "Recall",
+           .metric == "precision" ~ "Precision"
+         ))
+
+
+bind_rows(bootstrap_CI_results) %>% filter(!.metric %in% c("precision", "recall")) %>%
+  mutate(outcome = "IVDU") %>%
+  mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+  mutate(Stats = paste0(mean, "\n(", CI.lower, " - ", CI.upper, ")")) %>%
+  mutate(.metric = factor(.metric, levels = c("f_meas", "accuracy", "kap", "roc_auc", "pr_auc", "sens", "spec", "ppv", "npv"))) %>%
+  ggplot(
+    aes(y = fct_rev(outcome), x = .metric)) +
+  geom_tile(aes(fill = mean, width=0.9, height=0.9), size = 2) + 
+  #scale_color_manual(values = c("black", "white"), guide = F) +
+  geom_text(aes(label = Stats)) +
+  scale_fill_continuous_sequential(palette = "heat 2") +
+  labs(x = "Metric", y= "Outcome", fill = "") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                          text = element_text(size = 14))
+
+
+CI_results.tbl.w <- bind_rows(bootstrap_CI_results) %>%
+  mutate(outcome = "IVDU") %>%
+  pivot_wider(
+    id_cols = c(outcome),
+    names_from = .metric,
+    values_from = c(mean, CI.lower, CI.upper)
+  )
+
+table.95CI <- flextable::flextable(bootstrap_CI_results %>% 
+                                     select(Metric, `Mean estimate` = mean, `95% CI`)) %>%
+  set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in test dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.95CI
+
+#ROC Curve
+boot.metrics.roc.f <- bootstrap_results %>% 
+  collect_metrics(summarize = F) %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(.estimate) %>%
+  mutate(percentile = row_number()/nrow(.)) %>%
+  filter(percentile >=0.025 & percentile <=0.975)
+
+boot.metrics.roc2 <- bootstrap_results %>% 
+  collect_predictions() %>%
+  group_by(id) %>%
+  roc_curve(truth = IVDU, estimate = .pred_IVDU) 
+
+boot.metrics.roc2.f <- boot.metrics.roc.f %>% left_join(boot.metrics.roc2)
+
+p.tfidf.roc.boot <- ggplot() +
+  geom_path(data = boot.metrics.roc2.f, 
+            aes(x = 1 - specificity, y = sensitivity, group = id),
+            alpha = 0.5, color = "light grey",
+            inherit.aes = F) +
+  geom_path(data = boot.metrics.roc2.f %>% 
+              filter(abs(percentile - .5) == min(abs(percentile - .5))), 
+            aes(x = 1 - specificity, y = sensitivity, group = id),
+            alpha = 1, color = "blue", size = 1) +
+  geom_text_npc(aes(npcx = "right", npcy = "bottom"), 
+           label = paste0(bootstrap_CI_results[9,7], " = ", bootstrap_CI_results[9,2],
+                         ", 95% CI (", bootstrap_CI_results[9,6], ")")) +
+  geom_abline(lty = 3) + 
+  labs(x = "1 - Specificity", y = "Sensitivity") +
+  coord_equal() +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+p.tfidf.roc.boot
+
+ggsave(paste0("Plots/tf_idf_boot_roc_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 8, height =  10)
+ggsave(paste0("Plots/tf_idf_boot_roc_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 8, height =  10)
+
+#PR Curve
+#Plot bootstraps for PR_curve
+boot.metrics.pr.f <-  bootstrap_results %>% 
+  collect_metrics(summarize = F) %>%
+  filter(.metric == "pr_auc") %>%
+  arrange(.estimate) %>% 
+  mutate(percentile = row_number()/nrow(.)) %>%
+  filter(percentile >=0.025 & percentile <=0.975)
+
+boot.metrics.pr2 <- bootstrap_results %>% 
+  collect_predictions() %>%
+  group_by(id) %>%
+  pr_curve(truth = IVDU, estimate = .pred_IVDU) 
+
+boot.metrics.pr2.f <- boot.metrics.pr.f %>% left_join(boot.metrics.pr2)
+
+p.tfidf.pr.boot <- ggplot() +
+  geom_path(data = boot.metrics.pr2.f, 
+            aes(x = recall, y = precision, group = id),
+            alpha = 0.5, color = "light grey",
+            inherit.aes = F) +
+  geom_path(data = boot.metrics.pr2.f %>% 
+              filter(abs(percentile - .5) == min(abs(percentile - .5))), 
+            aes(x = recall, y = precision, group = id),
+            alpha = 1, color = "red", size = 1) +
+  geom_text_npc(aes(npcx = "right", npcy = "bottom"), #x = Inf, y = -Inf, hjust = 0.2, vjust = 0.2, 
+           label = paste0(bootstrap_CI_results[6,7], " = ", bootstrap_CI_results[6,2],
+                         ", 95% CI (", bootstrap_CI_results[6,6], ")")) +
+  labs(x = "Recall", y = "Precision") +
+  coord_equal() +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+p.tfidf.pr.boot
+
+ggsave(paste0("Plots/tf_idf_boot_pr_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 8, height =  10)
+ggsave(paste0("Plots/tf_idf_boot_pr_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 8, height =  10)
+
+
+cowplot::plot_grid(p.tfidf.roc.boot, p.tfidf.pr.boot,
+                   labels = c("A", "B"),
+                   align = "h")
+
+ggsave(paste0("Plots/tf_idf_boot_roc_pr_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 10, height =  8)
+ggsave(paste0("Plots/tf_idf_boot_roc_pr_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 10, height =  8)
+
+#Final tables/plots
+tables.list <- list(table.train.all.ranked, table.train.all.ranked.all.stats, table.train.best, table.test, table.95CI)
+
+#plot.list <- list(p.heat, p.heat2, test_CM_table)
+#p.variable.importance, 
+# write function
+
+p_load(officer, flextable)
+write_word_table <- function(var, doc){
+  doc %>%
+    body_add_flextable(var) %>% 
+    body_add_break() }
+
+write_word_plot <- function(var, doc){
+  doc %>%
+    body_add_gg(var, style = "centered", height = 6, width = 8) %>% 
+    body_end_section_landscape()
+}
+# list of tables and the doc
+my_doc1 <- officer::read_docx()
+
+# use walk (the invisible function of map) to include all tables in one doc
+walk(tables.list, write_word_table, my_doc1) 
+
+#include plots
+write_word_plot(statistic.plot.list, my_doc1)
+write_word_plot(statistic.best.plot.list, my_doc1) 
+write_word_plot(roc.list, my_doc1) 
+write_word_plot(pr.list, my_doc1)
+write_word_plot(test_CM_table, my_doc1) 
+write_word_plot(p.mimic.roc.boot, my_doc1) 
+write_word_plot(p.mimic.pr.boot, my_doc1) 
+
+#Create word doc
+print(my_doc1, target = paste0("Tables/NLP_tables_tf_idf", Sys.Date(), ".docx")) %>% invisible()
+```
+
+# Analysis 2 - TF-IDF with negation
+
+```{r Set up workflows}
+#Set-up recipe
+rec <- recipe(IVDU ~ text.neg, data = train)
+rec_uni <- rec %>%
+  update_role(text.neg, new_role = "predictor") %>%
+  update_role(IVDU, new_role = "outcome") %>%
+  step_tokenize(text.neg) %>%
+  step_stopwords(text.neg) %>%
+  step_tokenfilter(text.neg, min_times = 10, max_tokens = Inf) %>%
+  step_tfidf(text.neg)
+
+rec_bi <- rec %>%
+  update_role(text.neg, new_role = "predictor") %>%
+  update_role(IVDU, new_role = "outcome") %>%
+  step_tokenize(text.neg) %>%
+  step_stopwords(text.neg) %>%
+  step_ngram(text.neg,  num_tokens = 2, min_num_tokens = 1) %>%
+  step_tokenfilter(text.neg, min_times = 10, max_tokens = Inf) %>%
+  step_tfidf(text.neg)
+
+rec_tri <- rec %>%
+  update_role(text.neg, new_role = "predictor") %>%
+  update_role(IVDU, new_role = "outcome") %>%
+  step_tokenize(text.neg) %>%
+  step_stopwords(text.neg) %>%
+  step_ngram(text.neg,  num_tokens = 3, min_num_tokens = 1) %>%
+  step_tokenfilter(text.neg, min_times = 10, max_tokens = Inf) %>%
+  step_tfidf(text.neg)
+
+
+
+#Set-up workflow
+wflw_set <- workflow_set(
+      preproc = list(unigram = rec_uni, bigram = rec_bi, trigram = rec_tri), 
+      models = list(XGBoost = xgb_spec,
+                    Logistic.regression = log_spec, 
+                    #Naive.Bayes = nb_spec, 
+                    Random.forest = rf_spec,
+                    KNN = knn_spec, 
+                    SVM = svm_spec))
+
+       
+#Set up parameter tunning
+grid_ctrl <- control_grid(
+      save_pred = TRUE,
+      parallel_over = "everything",
+      save_workflow = F
+   )
+
+#Set up parallel processing
+parallel::detectCores()
+p_load(doParallel)
+cl <- makePSOCKcluster(8)
+registerDoParallel(cl)
+
+#Cross validation
+cv_folds <- vfold_cv(train, v = 10, strata = IVDU)
+```
+
+```{r Train model}
+#Fit model
+grid_results <- wflw_set %>%
+   workflow_map(
+      seed = 100,
+      resamples = cv_folds,
+      grid = 10,
+      control = grid_ctrl,
+      metrics = metric_set(recall, precision, f_meas, accuracy, kap, roc_auc, pr_auc, sens, yardstick::spec, ppv, npv),
+      verbose = T
+      )
+
+saveRDS(grid_results, paste0("Output/grid_results_", Sys.Date(), "tfidf+neg+reg.RDS"))
+
+#grid_results <- readRDS("Output/grid_results_2022-04-27tfidf+neg+reg.RDS")
+
+models.list <- c("Logistic regression",  "Random forest", "XGBoost", "KNN", "SVM") 
+recipe.model.list <- c("unigram_Logistic.regression", "unigram_Random.forest", 
+                       "unigram_XGBoost", "unigram_KNN",  "unigram_SVM",
+                       "bigram_Logistic.regression","bigram_Random.forest", 
+                       "bigram_XGBoost", "bigram_KNN",  "bigram_SVM",
+                       "trigram_Logistic.regression", "trigram_Random.forest", 
+                       "trigram_XGBoost", "trigram_KNN",  "trigram_SVM") 
+
+#Create table with all results
+results.list <- map2(recipe.model.list, recipe.model.list, 
+             ~ {
+               extract_workflow_set_result(grid_results, id = .x) %>% 
+                 collect_metrics() %>% 
+                 mutate(outcome = "IVDU", model = .y)
+               }
+             )
+
+results.tbl.w <- bind_rows(results.list) %>% pivot_wider(
+  id_cols = c(.config, outcome, model),
+  names_from = .metric,
+  values_from = mean
+)
+
+#Summary statistics
+statistic.plot.list <-  grid_results %>% 
+  autoplot() + 
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(title = "Metrics",
+       subtitle = "Predict IVDU in EHR notes") +
+    theme_minimal()
+
+
+statistic.best.plot.list <- grid_results %>% 
+  autoplot(select_best = TRUE) + 
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(title = "Metrics",
+       subtitle = "Predict IVDU in EHR notes") +
+    theme_minimal()
+
+
+#Rank models
+rank_res <- rank_results(grid_results, 
+               rank_metric = "f_meas", 
+               select_best = TRUE) 
+
+rank_res.w <- rank_res %>%
+  pivot_wider(
+    id_cols = c("wflow_id"),
+    names_from = ".metric",
+    values_from = "mean"
+  )
+
+
+rank_res.table <- rank_res %>% 
+  filter(.metric == "f_meas")
+
+rank_res.table <- bind_rows(rank_res.table) %>% mutate(outcome = "IVDU")
+
+#Create table for word
+table.train.all.ranked <- flextable::flextable(rank_res.table %>% 
+                                                 mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+                       select(`Model` = model, 
+                              `Mean\nF-score` = mean, SE = std_err)) %>%
+  set_caption(caption =  "Table. F-score in 10-fold cross validation of training dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.train.all.ranked
+
+table.train.all.ranked.all.stats <- flextable::flextable(
+  rank_res.w %>%
+    mutate(across(where(is.numeric), ~round(.x, 3)))) %>%
+  set_caption(caption =  "Table. Mean 10-fold cross validation metrics of training dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.train.all.ranked.all.stats
+
+
+
+#Create heatmap for F-measure by model/outcome
+p.heat <- ggplot(rank_res.table %>% mutate(rank2 = ifelse(rank == 1, 1, 2)), 
+       aes(y = .metric, x = model)) +
+    geom_tile(aes(fill = mean, color = as.factor(rank2), width=0.8, height=0.8), size = 2) + 
+  scale_color_manual(values = c("1" = "black", "2" = "white"), guide = F) +
+    geom_text(aes(label = round(mean, 3))) +
+    scale_fill_continuous_sequential(palette = "heat 2") +
+    labs(x = "Model", y= "Outcome", fill = "F-score") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Create ROC curves by model/outcome
+roc.list <- grid_results %>% 
+  collect_predictions() %>%
+  group_by(model) %>%
+  roc_curve(truth = IVDU, estimate = .pred_IVDU) %>%
+  autoplot() +
+  labs(
+    title = "Receiver operator curve - Training",
+    subtitle = "Predict IVDU in EHR data")
+
+
+#Create PR curve by model/outcome
+pr.list <- grid_results %>% 
+  collect_predictions() %>%
+  group_by(model) %>%
+  pr_curve(truth = IVDU, .pred_IVDU) %>%
+  autoplot() +
+  labs(
+    title = "Precision-recall curve - Training",
+    subtitle =  "Predict IVDU in EHR data")
+
+#Table of best models
+best_results.table <- rank_res %>% filter(.metric == "f_meas" & rank < 4)
+best_results.table <- bind_rows(best_results.table)
+
+#Create table for word
+table.train.best <- flextable::flextable(best_results.table %>% mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+                       select(`Model` = model, 
+                              `Mean\nF-score` = mean, SE = std_err)) %>%
+  set_caption(caption =  "Table. Best performing models in 10-fold cross validation of training dataset") %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.train.best
+
+#Select best model
+best_results.list <- grid_results %>% 
+   extract_workflow_set_result(rank_res$wflow_id[1]) %>% 
+   select_best(metric = "f_meas") %>% mutate(outcome = "IVDU")
+
+
+#Fit on test data
+p_load(tictoc)
+tic()
+test_results <- grid_results %>% 
+   extract_workflow(rank_res$wflow_id[1]) %>% 
+   finalize_workflow(best_results.list) %>% 
+   last_fit(split = df_split, 
+            metrics = metric_set(f_meas, accuracy, kap, roc_auc, sens, yardstick::spec, ppv, npv)) 
+time.testing <- toc()
+
+#Save/Load to local harddrive
+saveRDS(test_results, paste0("Output/test_results", as.character(Sys.Date()), "_tfidf+neg+regex.rds"))
+#test_results <- readRDS("Output/test_results2022-04-28_tfidf+neg+regex.rds")
+
+#Table for test results
+test_results.tbl <- test_results %>% collect_metrics() %>% mutate(outcome = "IVDU")
+test_results.tbl <- test_results.tbl %>% mutate(Metric = case_when(
+ .metric == "f_meas" ~ "F-score", 
+ .metric == "accuracy"  ~ "Accuracy",
+ .metric == "kap"~ "Kappa",
+ .metric == "sens" ~ "Sensitivity/Recall",
+ .metric == "spec" ~ "Specificity",
+ .metric == "ppv" ~ "Positive predictive value/Precision",
+ .metric == "npv" ~ "Negative predictive value",
+ .metric == "roc_auc" ~ "AUROC",
+ .metric == "pr_auc" ~ "AUPRC"
+))
+
+#Create table for word
+table.test <- flextable::flextable(test_results.tbl %>% mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+                       select(Metric, Estimate = .estimate)) %>%
+  set_caption(caption =  "Table. Diagnostic metrics of best performing models in test dataset") %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.test
+```
+
+```{r Error analysis}
+#Confusion matrix by model/outcome
+test_CM_table <- test_results %>% 
+  collect_predictions() %>% 
+ conf_mat(IVDU, .pred_class)  %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion matrix - Test set"
+  )
+
+#Error analysis from test set
+error_analysis <- test_results$.predictions[[1]] %>% #filter(.data[[.y]] != .pred_class) %>% 
+    mutate(Error = ifelse(IVDU != .pred_class,1,0))
+
+
+error_analysis_text <- error_analysis %>% left_join(df.pwid %>% mutate(.row = row_number()) %>% select(.row, text), by = ".row")
+
+
+#Save excel file with one df per sheet
+p_load(openxlsx)
+openxlsx::write.xlsx(error_analysis_text, paste0("Error/error_analysis_df_tfidf+neg+regex", Sys.Date(), "tfidf.xlsx"))
+
+error_analysis_all_data <- error_analysis %>% left_join(df.pwid.neg %>% mutate(.row = row_number()), by = ".row")
+
+openxlsx::write.xlsx(error_analysis_all_data, paste0("Error/error_analysis_df_tfidf+neg+regex", Sys.Date(), "tfidf.xlsx"))
+```
+
+```{r Bootstrapping}
+#Confidence intervals
+boot_test <- bootstraps(test, times = 1000, apparent = TRUE, strata = IVDU)
+
+
+tic()
+bootstrap_results <- grid_results %>% 
+   extract_workflow(rank_res$wflow_id[1]) %>% 
+   finalize_workflow(best_results.list) %>% 
+   fit_resamples(resamples = boot_test,
+            metrics = metric_set(recall, precision, f_meas, accuracy, kap, roc_auc, pr_auc, sens, yardstick::spec, ppv, npv),
+            control = control_resamples(verbose = T,
+                                   save_pred = T,
+                                   parallel_over = "everything")) 
+time.bootstrap <- toc()
+
+#Save/Load to local harddrive
+saveRDS(bootstrap_results, paste0("Output/bootstrap_results", as.character(Sys.Date()),"_tfidf+neg+regex.rds"))
+
+#bootstrap_results <- readRDS("Output/bootstrap_results2022-05-03_tfidf+neg+regex.rds")
+
+#Table results
+bootstrap_CI_results <- bootstrap_results %>% collect_metrics(summarize = FALSE) %>%
+    group_by(.metric) %>% 
+    summarize(mean = mean(.estimate, na.rm = T),
+                                  CI.lower = quantile(.estimate, probs = c(0.025), na.rm = T),
+                                  CI.upper = quantile(.estimate, probs = c(0.975), na.rm = T)
+                                  ) %>%
+    mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+    mutate(outcome = "IVDU", 
+           `95% CI` = paste0(CI.lower, " - ", CI.upper),
+           Metric = case_when(
+ .metric == "f_meas" ~ "F-score", 
+ .metric == "accuracy"  ~ "Accuracy",
+ .metric == "kap"~ "Kappa",
+ .metric == "sens" ~ "Sensitivity/Recall",
+ .metric == "spec" ~ "Specificity",
+ .metric == "ppv" ~ "Positive predictive value/Precision",
+ .metric == "npv" ~ "Negative predictive value",
+ .metric == "roc_auc" ~ "AUROC",
+ .metric == "recall" ~ "Recall",
+ .metric == "precision" ~ "Precision",
+ .metric == "pr_auc" ~ "AUPRC"
+))
+
+
+bind_rows(bootstrap_CI_results) %>% filter(!.metric %in% c("precision", "recall")) %>%
+  mutate(outcome = "IVDU") %>%
+  mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+  mutate(Stats = paste0(mean, "\n(", CI.lower, " - ", CI.upper, ")")) %>%
+  mutate(.metric = factor(.metric, levels = c("f_meas", "accuracy", "kap", "roc_auc", "pr_auc", "sens", "spec", "ppv", "npv"))) %>%
+  ggplot(
+       aes(y = fct_rev(outcome), x = .metric)) +
+    geom_tile(aes(fill = mean, width=0.9, height=0.9), size = 2) + 
+  #scale_color_manual(values = c("black", "white"), guide = F) +
+    geom_text(aes(label = Stats)) +
+    scale_fill_continuous_sequential(palette = "heat 2") +
+    labs(x = "Metric", y= "Outcome", fill = "") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                          text = element_text(size = 14))
+
+
+CI_results.tbl.w <- bind_rows(bootstrap_CI_results) %>%
+    mutate(outcome = "IVDU") %>%
+  pivot_wider(
+  id_cols = c(outcome),
+  names_from = .metric,
+  values_from = c(mean, CI.lower, CI.upper)
+)
+
+table.95CI <- flextable::flextable(bootstrap_CI_results %>% 
+    select(Metric, `Mean estimate` = mean, `95% CI`)) %>%
+  set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in test dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.95CI
+
+
+#ROC Curve
+boot.metrics.roc.f <- bootstrap_results %>% 
+  collect_metrics(summarize = F) %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(.estimate) %>%
+  mutate(percentile = row_number()/nrow(.)) %>%
+  filter(percentile >=0.025 & percentile <=0.975)
+
+boot.metrics.roc2 <- bootstrap_results %>% 
+  collect_predictions() %>%
+  group_by(id) %>%
+  roc_curve(truth = IVDU, estimate = .pred_IVDU) 
+
+boot.metrics.roc2.f <- boot.metrics.roc.f %>% left_join(boot.metrics.roc2)
+
+p.negex.roc.boot <- ggplot() +
+  geom_path(data = boot.metrics.roc2.f, 
+            aes(x = 1 - specificity, y = sensitivity, group = id),
+            alpha = 0.5, color = "light grey",
+            inherit.aes = F) +
+  geom_path(data = boot.metrics.roc2.f %>% 
+              filter(abs(percentile - .5) == min(abs(percentile - .5))), 
+            aes(x = 1 - specificity, y = sensitivity, group = id),
+            alpha = 1, color = "blue", size = 1) +
+  geom_text_npc(aes(npcx = "right", npcy = "bottom"), 
+           label = paste0(bootstrap_CI_results[9,7], " = ", bootstrap_CI_results[9,2],
+                         ", 95% CI (", bootstrap_CI_results[9,6], ")")) +
+  geom_abline(lty = 3) + 
+  labs(x = "1 - Specificity", y = "Sensitivity") +
+  coord_equal() +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+p.negex.roc.boot
+
+ggsave(paste0("Plots/tf_idf_neg_boot_roc_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 8, height =  10)
+ggsave(paste0("Plots/tf_idf_neg_boot_roc_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 8, height =  10)
+
+p_load(ggpmisc)
+
+#PR Curve
+#Plot bootstraps for PR_curve
+boot.metrics.pr.f <-  bootstrap_results %>% 
+  collect_metrics(summarize = F) %>%
+  filter(.metric == "pr_auc") %>%
+  arrange(.estimate) %>% 
+  mutate(percentile = row_number()/nrow(.)) %>%
+  filter(percentile >=0.025 & percentile <=0.975)
+
+boot.metrics.pr2 <- bootstrap_results %>% 
+  collect_predictions() %>%
+  group_by(id) %>%
+  pr_curve(truth = IVDU, estimate = .pred_IVDU) 
+
+boot.metrics.pr2.f <- boot.metrics.pr.f %>% left_join(boot.metrics.pr2)
+
+p.negex.pr.boot <- ggplot() +
+  geom_path(data = boot.metrics.pr2.f, 
+            aes(x = recall, y = precision, group = id),
+            alpha = 0.5, color = "light grey",
+            inherit.aes = F) +
+  geom_path(data = boot.metrics.pr2.f %>% 
+              filter(abs(percentile - .5) == min(abs(percentile - .5))), 
+            aes(x = recall, y = precision, group = id),
+            alpha = 1, color = "red", size = 1) +
+  geom_text_npc(aes(npcx = "right", npcy = "bottom"), #x = Inf, y = -Inf, hjust = 0.2, vjust = 0.2, 
+           label = paste0(bootstrap_CI_results[6,7], " = ", bootstrap_CI_results[6,2],
+                         ", 95% CI (", bootstrap_CI_results[6,6], ")")) +
+  labs(x = "Recall", y = "Precision") +
+  coord_equal() +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+p.negex.pr.boot
+
+
+ggsave(paste0("Plots/tf_idf_neg_boot_pr_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 8, height =  10)
+ggsave(paste0("Plots/tf_idf_neg_boot_pr_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 8, height =  10)
+
+cowplot::plot_grid(p.negex.roc.boot, p.negex.pr.boot,
+                   labels = c("A", "B"),
+                   align = "h")
+
+ggsave(paste0("Plots/tf_idf_neg_boot_roc_pr_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 10, height =  8)
+ggsave(paste0("Plots/tf_idf_neg_boot_roc_pr_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 10, height =  8)
+
+#Export Final tables/plots
+tables.list <- list(table.train.all.ranked, table.train.all.ranked.all.stats, table.train.best, table.test, table.95CI)
+
+#plot.list <- list(p.heat, p.heat2, test_CM_table)
+#p.variable.importance, 
+# write function
+
+p_load(officer, flextable)
+write_word_table <- function(var, doc){
+  doc %>%
+    body_add_flextable(var) %>% 
+    body_add_break() }
+
+write_word_plot <- function(var, doc){
+  doc %>%
+    body_add_gg(var, style = "centered", height = 6, width = 8) %>% 
+    body_end_section_landscape()
+    }
+# list of tables and the doc
+my_doc1 <- officer::read_docx()
+
+# use walk (the invisible function of map) to include all tables in one doc
+walk(tables.list, write_word_table, my_doc1) 
+
+#include plots
+write_word_plot(statistic.plot.list, my_doc1)
+write_word_plot(statistic.best.plot.list, my_doc1) 
+write_word_plot(roc.list, my_doc1) 
+write_word_plot(pr.list, my_doc1) 
+write_word_plot(test_CM_table, my_doc1) 
+write_word_plot(p.negex.roc.boot, my_doc1) 
+write_word_plot(p.negex.pr.boot, my_doc1) 
+
+#Create word doc
+print(my_doc1, target = paste0("Tables/NLP_tables_tf_idf_neg_", Sys.Date(), ".docx")) %>% invisible()
+```
+
+## ICD-9 analysis
+
+```{r ICD}
+df.diagnosis.m <- readRDS("Data/df_diagnosis_m.rds")
+
+#Create IC9 codes for each relevant diagnosis in algorithm
+HIV <- c("042", "V08")
+HCV <- c("07041", "07044", "07051", "07054", "07070", "07071", "V0262")
+Opioid <- c("30550", "30551", "30552", "30553", "30400", "30401", "30402", "30403","30404")
+Cocaine <- c("30560", "30561", "30562", "30563", "30420", "30421", "30422", "30423","30424")
+Stimulant <- c("30570", "30571", "30572", "30573", "30440", "30441", "30442", "30443","30444")
+Psycoactive <- c("30590", "30591", "30592", "30593", "30460", "30461", "30462", "30463","30464")
+Drug.use <- c("30550", "30551", "30552", "30553", "30400", "30401", "30402", "30403","30404", 
+              "30560", "30561", "30562", "30563", "30420", "30421", "30422", "30423","30424",
+              "30570", "30571", "30572", "30573", "30440", "30441", "30442", "30443","30444",
+              "30590", "30591", "30592", "30593", "30460", "30461", "30462", "30463","30464")
+Homeless <- c("V600")
+Drug.psychosis <- c("2920", "29211", "29212", "29281", "29282", "29283", "29284", "29285", "29289", "2922",  "2929")
+
+#Collapse ICD9 codes for each subject into one cell
+df.diagnosis.m <- df.diagnosis.m %>% mutate(ICD9Code1 = str_remove_all(ICD9Code, pattern = "\\."))
+df.diagnosis.m1 <- df.diagnosis.m %>% group_by(PatientSID) %>%
+  summarize(ICD9 = str_c(ICD9Code1, collapse = " "))
+
+#Create indicator for having a code for a diagnosis
+df.diagnosis.m1$HIV <- ifelse(str_detect(df.diagnosis.m1$ICD9, paste(HIV, collapse = '|')), 1, 0)
+df.diagnosis.m1$HCV <- ifelse(str_detect(df.diagnosis.m1$ICD9, paste(HCV, collapse = '|')), 1, 0)
+df.diagnosis.m1$Drug.use <- ifelse(str_detect(df.diagnosis.m1$ICD9, paste(Drug.use, collapse = '|')), 1, 0)
+df.diagnosis.m1$Drug.psychosis <- ifelse(str_detect(df.diagnosis.m1$ICD9, paste(Drug.psychosis, collapse = '|')), 1, 0)
+df.diagnosis.m1$Homeless <- ifelse(str_detect(df.diagnosis.m1$ICD9, paste(Homeless, collapse = '|')), 1, 0)
+
+#Create indicator for each algorithm in Ball paper
+df.diagnosis.m1 <- df.diagnosis.m1 %>%
+  mutate(`Algorithm 6` = ifelse(HIV == 1 | HCV == 1, 1, 0),
+         `Algorithm 7` = ifelse(HIV == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 8` = ifelse(HIV == 1 | Drug.psychosis == 1, 1, 0),
+         `Algorithm 9` = ifelse(HCV == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 10` = ifelse(HCV == 1 | Drug.psychosis == 1, 1, 0),
+         `Algorithm 11` = ifelse(Drug.psychosis == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 12` = ifelse(HIV == 1 | HCV == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 13` = ifelse(HIV == 1 | HCV == 1 | Drug.psychosis == 1, 1, 0),
+         `Algorithm 14` = ifelse(HCV == 1 | Drug.psychosis == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 15` = ifelse(HIV == 1 | HCV == 1 | Drug.psychosis == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 16` = ifelse(HIV == 1 | HCV == 1 | Drug.psychosis == 1 | Drug.use == 1 | Homeless == 1, 1, 0)
+  )
+
+#skimr::skim(df.diagnosis.m1)
+
+saveRDS(df.diagnosis.m1, "Data/df_ICD_all.rds")
+```
+
+
+```{r}
+#Create Train/test split
+df.pwid.neg <- df.pwid.neg %>%
+	left_join(train %>% select(PatientSID, TIUDocumentSID) %>% mutate(Split = "Train"),
+			by = c("PatientSID", "TIUDocumentSID"))
+
+df.pwid.neg <- df.pwid.neg %>% mutate(Split = replace_na(Split, "Test"))
+df.pwid.neg$Split <- factor(df.pwid.neg$Split, levels = c("Train", "Test"))
+
+#Join to truth dataset
+df.pwid.icd <- df.pwid.neg %>% left_join(df.diagnosis.m1, by = "PatientSID")
+df.pwid.icd <- df.pwid.icd %>% mutate(across(HIV:`Algorithm 16`, ~ replace_na(., 0)))
+
+#Descriptive
+tbl.descriptives <- df.pwid.icd %>%
+  select(Split, HIV, HCV, Drug.use, Drug.psychosis, Homeless,
+         "Algorithm 6", "Algorithm 7", "Algorithm 8", "Algorithm 9", "Algorithm 10", 
+                    "Algorithm 11", "Algorithm 12", "Algorithm 13", "Algorithm 14", "Algorithm 15", "Algorithm 16") %>%
+  tbl_summary(
+    		by = Split,
+		sort = all_categorical() ~ "frequency") %>%
+	add_overall() %>%
+	add_p() %>%
+  as_flex_table() %>%
+    	set_table_properties(layout = "autofit") %>%
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+tbl.descriptives
+
+#Evaluate ICD metrics
+ICD.Algorithms <- c("Algorithm 6", "Algorithm 7", "Algorithm 8", "Algorithm 9", "Algorithm 10", 
+                    "Algorithm 11", "Algorithm 12", "Algorithm 13", "Algorithm 14", "Algorithm 15", "Algorithm 16")
+
+icd.cm <- map(ICD.Algorithms, ~ {
+  evaluate(df.pwid.icd %>% mutate(IVDU2 = ifelse(IVDU == "IVDU", 1, 0)),
+           target_col = "IVDU2",
+           prediction_cols = .x,
+           type = "binomial")
+})
+
+#Get table summarising metrics
+ICD.table <- bind_cols(ICD.Algorithms, bind_rows(icd.cm)) %>% rename(Algorithm = ...1)
+ICD.table <- ICD.table %>% mutate(across(where(is.numeric), ~ round(., 3)))
+ft.ICD.table <- flextable(ICD.table %>% select(!c("Prevalence", "Predictions", "ROC", "Confusion Matrix", "Process"))) %>%
+  set_caption("Diagnostic metrics for different algorithsm based on ICD codes") %>%
+  	set_table_properties(layout = "autofit") %>%
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+
+#Set up for ROC plot
+ICD.roc <- map2(1:length(ICD.Algorithms), ICD.Algorithms, ~ {
+  bind_rows(icd.cm[[.x]]$Predictions %>%
+              as.data.frame() %>%
+              mutate(Algorithm = paste(.y)))
+})
+ICD.roc <- bind_rows(ICD.roc)
+ICD.roc$Algorithm <- factor(ICD.roc$Algorithm, 
+                            levels = c( c("Algorithm 6", "Algorithm 7", "Algorithm 8", 
+                                          "Algorithm 9", "Algorithm 10", "Algorithm 11", 
+                                          "Algorithm 12", "Algorithm 13", "Algorithm 14",
+                                          "Algorithm 15", "Algorithm 16")))
+
+#Plot ROC
+p.icd.roc <- ggplot(data = ICD.roc, aes(m = Prediction, d =Target, color = Algorithm)) +
+  geom_roc(n.cuts = 20, labels = F, size = 1) + 
+  labs(y = "Sensitivity", x = "1 - Specificity") +
+  theme_minimal()
+p.icd.roc 
+#ggsave("plots/ICD_ROC_plot.png", dpi = 600, height = 8, width = 10)
+```
+
+```{r Test dataset only}
+df.test.icd <- test %>% left_join(df.diagnosis.m1, by = "PatientSID")
+df.test.icd <- df.test.icd %>% mutate(across(HIV:`Algorithm 16`, ~ replace_na(., 0)))
+df.test.icd <- df.test.icd %>% mutate(IVDU2 = ifelse(IVDU == "IVDU", 1, 0))
+
+
+#Evaluate ICD metrics
+ICD.Algorithms <- c("Algorithm 6", "Algorithm 7", "Algorithm 8", "Algorithm 9", "Algorithm 10", 
+                    "Algorithm 11", "Algorithm 12", "Algorithm 13", "Algorithm 14", "Algorithm 15", "Algorithm 16")
+icd.test.cm <- map(ICD.Algorithms, ~ {
+  evaluate(df.test.icd,
+           target_col = "IVDU2",
+           prediction_cols = .x,
+           type = "binomial")
+})
+
+#Get table summarizing metrics
+ICD.test.table <- bind_cols(ICD.Algorithms, bind_rows(icd.test.cm)) %>% rename(Algorithm = ...1)
+ICD.test.table <- ICD.test.table %>% mutate(across(where(is.numeric), ~ round(., 3)))
+tbl.ICD.test.metrics <- flextable(ICD.test.table %>% 
+                            select(!c("Prevalence", "Predictions", "ROC", "Confusion Matrix", "Process"))) %>%
+  set_caption("Diagnostic metrics for different algorithsm based on ICD codes") %>%
+  	set_table_properties(layout = "autofit") %>%
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+tbl.ICD.test.metrics
+
+#Set up for ROC plot
+ICD.test.roc <- map2(1:length(ICD.Algorithms), ICD.Algorithms, ~ {
+  bind_rows(icd.test.cm[[.x]]$Predictions %>%
+              as.data.frame() %>%
+              mutate(Algorithm = paste(.y)))
+})
+ICD.test.roc <- bind_rows(ICD.test.roc)
+ICD.test.roc$Algorithm <- factor(ICD.test.roc$Algorithm, 
+                            levels = c( c("Algorithm 6", "Algorithm 7", "Algorithm 8", 
+                                          "Algorithm 9", "Algorithm 10", "Algorithm 11", 
+                                          "Algorithm 12", "Algorithm 13", "Algorithm 14",
+                                          "Algorithm 15", "Algorithm 16")))
+
+#Plot ROC
+p.icd.test.roc <- ggplot(data = ICD.test.roc, aes(m = Prediction, d =Target, color = Algorithm)) +
+  geom_roc(n.cuts = 20, labels = F, size = 1) + 
+  labs(y = "Sensitivity", x = "1 - Specificity") +
+  theme_minimal()
+p.icd.test.roc 
+#ggsave("plots/ICD_test_ROC_plot.png", dpi = 600, height = 8, width = 10)
+```
+
+```{r Bootstrapping}
+plan(multisession, workers = 8)
+
+#Confidence intervals
+boot_test_icd <- bootstraps(df.test.icd, times = 1000, apparent = TRUE, strata = IVDU)
+
+
+bootstrap_metrics <- function(split) {
+map(ICD.Algorithms, ~ {
+  evaluate(analysis(split),
+           target_col = "IVDU2",
+           prediction_cols = .x,
+           type = "binomial") %>%
+    mutate(algorithm = .x)
+})
+}
+
+boot_icd <- boot_test_icd %>% 
+  mutate(metrics = future_map(splits, bootstrap_metrics, .options = furrr_options(seed = 100)))
+
+boot_icd_results <- bind_rows(boot_icd$metrics)
+
+boot_icd_results$algorithm <- factor(boot_icd_results$algorithm,
+                            levels = c( c("Algorithm 6", "Algorithm 7", "Algorithm 8", 
+                                          "Algorithm 9", "Algorithm 10", "Algorithm 11", 
+                                          "Algorithm 12", "Algorithm 13", "Algorithm 14",
+                                          "Algorithm 15", "Algorithm 16")))
+
+bootstrap_icd_CI_results <- boot_icd_results %>% 
+  select(-`Lower CI`, -`Upper CI`, -MCC, -`Detection Rate`, -`Detection Prevalence`, -Prevalence,
+         -Predictions, -ROC, -`Confusion Matrix`, -Process, -`Balanced Accuracy`) %>%
+      group_by(algorithm) %>% 
+  pivot_longer(
+    cols = c(Accuracy:Kappa),
+    names_to = ".metric",
+    values_to = ".estimate"
+  ) %>%
+    group_by(algorithm, .metric) %>% 
+    summarize(mean = mean(.estimate, na.rm = T),
+                                  CI.lower = quantile(.estimate, probs = c(0.025), na.rm = T),
+                                  CI.upper = quantile(.estimate, probs = c(0.975), na.rm = T)
+                                  ) %>%
+    mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+    mutate(outcome = "IVDU", 
+           `95% CI` = paste0(CI.lower, " - ", CI.upper),
+           Metric = case_when(
+ .metric == "F1" ~ "F-score", 
+ .metric == "Accuracy"  ~ "Accuracy",
+ .metric == "Kappa"~ "Kappa",
+ .metric == "Sensitivity" ~ "Sensitivity/Recall",
+ .metric == "Specificity" ~ "Specificity",
+ .metric == "Pos Pred Value" ~ "Positive predictive value/Precision",
+ .metric == "Neg Pred Value" ~ "Negative predictive value",
+ .metric == "AUC" ~ "AUROC"
+))
+
+table.ICD.95CI <- flextable::flextable(bootstrap_icd_CI_results %>% 
+    select(Algorithm = algorithm, Metric, `Mean estimate` = mean, `95% CI`)) %>%
+  set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in test dataset for ICD codes") %>%
+  	set_table_properties(layout = "autofit") %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.ICD.95CI
+
+table.ICD.95CI.w <- bootstrap_icd_CI_results %>% 
+  mutate(`Mean\n(95% CI)` = paste0(mean, "\n", "(", `95% CI`, ")")) %>%
+  select(Algorithm = algorithm, Metric, `Mean\n(95% CI)`) %>%
+  pivot_wider(
+    id_cols = Algorithm,
+    names_from = Metric,
+    values_from = `Mean\n(95% CI)`
+  )
+
+tbl.ICD.95CI.w <- flextable::flextable(table.ICD.95CI.w) %>% 
+      set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in test dataset for ICD codes") %>%
+  	set_table_properties(layout = "autofit") %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+tbl.ICD.95CI.w
+```
+
+```{r Export to word}
+
+#Final tables/plots
+tables.list <- list(tbl.descriptives, tbl.ICD.test.metrics, tbl.ICD.95CI.w)
+
+#plot.list <- list(p.heat, p.heat2, test_CM_table)
+#p.variable.importance, 
+# write function
+p_load(officer, flextable)
+write_word_table <- function(var, doc){
+  doc %>%
+    body_add_flextable(var) %>% 
+    body_end_section_landscape()  
+  }
+
+write_word_plot <- function(var, doc){
+  doc %>%
+    body_add_gg(var, style = "centered", height = 6, width = 8) %>% 
+    body_end_section_landscape()
+    }
+# list of tables and the doc
+my_doc1 <- officer::read_docx()
+
+# use walk (the invisible function of map) to include all tables in one doc
+walk(tables.list, write_word_table, my_doc1) 
+
+# use walk to include plots
+my_doc1 <- body_add_gg(my_doc1, p.icd.test.roc, style = "centered", height = 6, width = 8) %>% 
+    body_end_section_landscape()  
+
+
+#Create word doc
+print(my_doc1, target = paste0("Tables/ICD_tables_", Sys.Date(), ".docx")) %>% invisible()
+```
+
+
+#Sensitivity analyses - 1 Mimic
+
+```{r Prediction mimic}
+df.mimic.neg <- readRDS("Data/df_mimic_neg_regex.rds")
+df.remove <- df.mimic.neg %>% filter(IVDU2 == "Non-IVDU") %>% slice_sample(n = 15)
+df.mimic.neg <- df.mimic.neg %>% anti_join(df.remove) 
+
+#grid_results <- readRDS("Output/grid_results_2022-03-28tfidf+neg+reg.RDS")
+test_results <- readRDS("Output/test_results2022-04-28_tfidf+neg+regex.rds")
+test_fitted <- test_results$.workflow[[1]]
+
+test_fitted <- readRDS("Output/fit_model_predict.rds")
+df.predicted.mimic <- bind_cols(df.mimic.neg, 
+                                predict(test_fitted, new_data = df.mimic.neg, type = "class"),
+                                predict(test_fitted, new_data = df.mimic.neg, type = "prob"))
+df.predicted.mimic <- df.predicted.mimic %>% mutate(Error = ifelse(IVDU != .pred_class,1,0))
+
+#Calculate metrics
+metrics_class <- metric_set(recall, precision, f_meas, accuracy, kap, yardstick::sens, yardstick::spec, ppv, npv)
+metrics_pred <- metric_set(roc_auc, pr_auc)
+df.mimic.metrics <- bind_rows(df.predicted.mimic %>% metrics_class(truth = "IVDU2", estimate = ".pred_class"),
+                              df.predicted.mimic %>% roc_auc(truth = "IVDU2", estimate = ".pred_IVDU"),
+                              df.predicted.mimic %>% pr_auc(truth = "IVDU2", estimate = ".pred_IVDU"))
+df.mimic.metrics <- df.mimic.metrics %>% mutate(across(where(is.numeric), ~round(.,3)))
+
+#Set up plots
+p.mimic.roc <- df.predicted.mimic %>% roc_curve(truth = "IVDU2", estimate = ".pred_IVDU") %>% autoplot()
+p.mimic.pr <- df.predicted.mimic %>% pr_curve(truth = "IVDU2", estimate = ".pred_IVDU") %>% autoplot()
+p.mimic.cm <- df.predicted.mimic %>% conf_mat(truth = "IVDU2", estimate = ".pred_class") %>% autoplot(type = "heatmap")
+
+saveRDS(df.predicted.mimic, "Data/df_mimic_predicted.rds")
+
+write_csv(df.predicted.mimic, "Error/df_mimic_predicted_error.csv")
+
+df.predicted.mimic <- readRDS("Data/df_mimic_predicted.rds")
+
+#Confidence intervals
+boot_mimic <- rsample::bootstraps(df.predicted.mimic, times = 1000, apparent = TRUE, strata = IVDU2)
+
+#Set up functions
+metrics_class <- metric_set(recall, precision, f_meas, accuracy, kap, yardstick::sens, yardstick::spec, ppv, npv)
+metrics_pred <- metric_set(roc_auc, pr_auc)
+
+get_metrics <- function(splits, y) {
+  x <- analysis(splits)
+  metrics_class(x, truth = "IVDU2", estimate = ".pred_class") %>% mutate(id = y)
+}
+
+get_roc <- function(splits, y) {
+  x <- analysis(splits)
+  roc_auc(x, truth = "IVDU2", estimate = ".pred_IVDU") %>% mutate(id = y)
+}
+
+get_pr <- function(splits, y) {
+  x <- analysis(splits)
+  pr_auc(x, truth = "IVDU2", estimate = ".pred_IVDU") %>% mutate(id = y)
+}
+
+
+#Map functions to bootstraps
+boot.metrics <- future_map2_dfr(boot_mimic$splits, 1:1001, get_metrics)
+boot.metrics.roc <- future_map2_dfr(boot_mimic$splits, 1:1001, get_roc)
+boot.metrics.pr <- future_map2_dfr(boot_mimic$splits, 1:1001, get_pr)
+boot.metrics <- bind_rows(boot.metrics, boot.metrics.roc, boot.metrics.pr)
+
+
+#Table results
+bootstrap_CI_results <- boot.metrics %>% 
+  group_by(.metric) %>% 
+  summarize(mean = mean(.estimate, na.rm = T),
+            CI.lower = quantile(.estimate, probs = c(0.025), na.rm = T),
+            CI.upper = quantile(.estimate, probs = c(0.975), na.rm = T)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  mutate(outcome = "IVDU", 
+         `95% CI` = paste0(CI.lower, " - ", CI.upper),
+         Metric = case_when(
+           .metric == "f_meas" ~ "F-score", 
+           .metric == "accuracy"  ~ "Accuracy",
+           .metric == "kap"~ "Kappa",
+           .metric == "sens" ~ "Sensitivity/Recall",
+           .metric == "spec" ~ "Specificity",
+           .metric == "ppv" ~ "Positive predictive value/Precision",
+           .metric == "npv" ~ "Negative predictive value",
+           .metric == "roc_auc" ~ "AUROC",
+           .metric == "recall" ~ "Recall",
+           .metric == "precision" ~ "Precision",
+           .metric == "pr_auc" ~ "AUPRC"
+         ))
+
+CI_results.tbl.w <- bind_rows(bootstrap_CI_results) %>%
+  mutate(outcome = "IVDU") %>%
+  pivot_wider(
+    id_cols = c(outcome),
+    names_from = .metric,
+    values_from = c(mean, CI.lower, CI.upper)
+  )
+
+table.mimic.95CI <- flextable::flextable(bootstrap_CI_results %>% 
+                                     select(Metric, `Mean estimate` = mean, `95% CI`)) %>%
+  set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in  MIMIC dataset") %>%
+  autofit() %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+
+table.mimic.95CI
+
+#Plot bootstraps for ROC_AUC
+get_roc_curve <- function(splits, y) {
+  x <- analysis(splits)
+  roc_curve(x, truth = "IVDU2", estimate = ".pred_IVDU") %>% mutate(id = y)
+}
+
+boot.metrics.roc.f <- boot.metrics.roc %>% 
+  arrange(.estimate) %>% 
+  mutate(percentile = row_number()/nrow(boot.metrics.roc)) %>%
+  filter(percentile >=0.025 & percentile <=0.975)
+
+boot.metrics.roc2 <- future_map2_dfr(boot_mimic$splits, 1:1001, get_roc_curve)
+boot.metrics.roc2.f <- boot.metrics.roc.f %>% left_join(boot.metrics.roc2)
+
+p.mimic.roc.boot <- ggplot() +
+  geom_path(data = boot.metrics.roc2.f, 
+            aes(x = 1 - specificity, y = sensitivity, group = id),
+            alpha = 0.5, color = "light grey",
+            inherit.aes = F) +
+  geom_path(data = boot.metrics.roc2.f %>% 
+              filter(abs(percentile - .5) == min(abs(percentile - .5))), 
+            aes(x = 1 - specificity, y = sensitivity, group = id),
+            alpha = 1, color = "blue", size = 1) +
+  geom_text_npc(aes(npcx = "right", npcy = "bottom"), 
+           label = paste0(bootstrap_CI_results[9,7], " = ", bootstrap_CI_results[9,2],
+                         ", 95% CI (", bootstrap_CI_results[9,6], ")")) +
+  geom_abline(lty = 3) + 
+  labs(x = "1 - Specificity", y = "Sensitivity") +
+  coord_equal() +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+p.mimic.roc.boot
+
+ggsave(paste0("Plots/mimic_boot_roc_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 8, height =  10)
+ggsave(paste0("Plots/mimic_boot_roc_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 8, height =  10)
+
+
+#Plot bootstraps for PR_curve
+get_pr_curve <- function(splits, y) {
+  x <- analysis(splits)
+  pr_curve(x, truth = "IVDU2", estimate = ".pred_IVDU") %>% mutate(id = y)
+}
+
+boot.metrics.pr.f <- boot.metrics.pr %>% 
+  arrange(.estimate) %>% 
+  mutate(percentile = row_number()/nrow(boot.metrics.pr)) %>%
+  filter(percentile >=0.025 & percentile <=0.975)
+
+boot.metrics.pr2 <- future_map2_dfr(boot_mimic$splits, 1:1001, get_pr_curve)
+boot.metrics.pr2.f <- boot.metrics.pr.f %>% left_join(boot.metrics.pr2)
+
+p.mimic.pr.boot <- ggplot() +
+  geom_path(data = boot.metrics.pr2.f, 
+            aes(x = recall, y = precision, group = id),
+            alpha = 0.5, color = "light grey",
+            inherit.aes = F) +
+  geom_path(data = boot.metrics.pr2.f %>% 
+              filter(abs(percentile - .5) == min(abs(percentile - .5))), 
+            aes(x = recall, y = precision, group = id),
+            alpha = 1, color = "red", size = 1) +
+  geom_text_npc(aes(npcx = "right", npcy = "bottom"), #x = Inf, y = -Inf, hjust = 0.2, vjust = 0.2, 
+           label = paste0(bootstrap_CI_results[6,7], " = ", bootstrap_CI_results[6,2],
+                         ", 95% CI (", bootstrap_CI_results[6,6], ")")) +
+  labs(x = "Recall", y = "Precision") +
+  coord_equal() +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+p.mimic.pr.boot
+
+ggsave(paste0("Plots/mimic_boot_pr_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 8, height =  10)
+ggsave(paste0("Plots/mimic_boot_pr_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 8, height =  10)
+
+
+cowplot::plot_grid(p.mimic.roc.boot, p.mimic.pr.boot,
+                   labels = c("A", "B"),
+                   align = "h")
+
+ggsave(paste0("Plots/mimic_boot_roc_pr_curve",Sys.Date(),".png"), 
+       dpi = 300, width = 10, height =  8)
+ggsave(paste0("Plots/mimic_boot_roc_pr_curve",Sys.Date(),".pdf"), 
+       dpi = 300, width = 10, height =  8)
+
+
+
+```
+
+```{r Load data for Mimic ICD}
+df.mimic.icd <- read_csv("Data/DIAGNOSES_ICD.csv.gz")
+df.mimic.pwid <- read.csv("Data/211216_ivdu.csv")
+df.mimic.ids <-  read_csv("Data/Positive_matched.csv")
+df.mimic.patient <- read_csv("Data/PATIENTS.csv.gz")
+df.mimic.admission <- read_csv("Data/ADMISSIONS.csv.gz")
+
+df.mimic.ids <- df.mimic.ids %>% rename(doc_id = ...1)
+df.mimic.ids$id <- as.character(df.mimic.ids$Random_ID)
+df.mimic.icd <- df.mimic.icd %>% inner_join(df.mimic.ids %>% select(SUBJECT_ID), by = "SUBJECT_ID")
+
+#Descriptive
+
+#Create IC9 codes for each relevant diagnosis in algorithm
+HIV <- c("042", "V08")
+HCV <- c("07041", "07044", "07051", "07054", "07070", "07071", "V0262")
+Opioid <- c("30550", "30551", "30552", "30553", "30400", "30401", "30402", "30403","30404")
+Cocaine <- c("30560", "30561", "30562", "30563", "30420", "30421", "30422", "30423","30424")
+Stimulant <- c("30570", "30571", "30572", "30573", "30440", "30441", "30442", "30443","30444")
+Psycoactive <- c("30590", "30591", "30592", "30593", "30460", "30461", "30462", "30463","30464")
+Drug.use <- c("30550", "30551", "30552", "30553", "30400", "30401", "30402", "30403","30404", 
+              "30560", "30561", "30562", "30563", "30420", "30421", "30422", "30423","30424",
+              "30570", "30571", "30572", "30573", "30440", "30441", "30442", "30443","30444",
+              "30590", "30591", "30592", "30593", "30460", "30461", "30462", "30463","30464")
+Homeless <- c("V600")
+Drug.psychosis <- c("2920", "29211", "29212", "29281", "29282", "29283", "29284", "29285", "29289", "2922",  "2929")
+
+#Collapse ICD9 codes for each subject into one cell
+df.mimic.icd.c <- df.mimic.icd %>% group_by(SUBJECT_ID) %>%
+  summarize(ICD9 = str_c(ICD9_CODE, collapse = " "))
+
+#Create indicator for having a code for a diagnosis
+df.mimic.icd.c$HIV <- ifelse(str_detect(df.mimic.icd.c$ICD9, paste(HIV, collapse = '|')), 1, 0)
+df.mimic.icd.c$HCV <- ifelse(str_detect(df.mimic.icd.c$ICD9, paste(HCV, collapse = '|')), 1, 0)
+df.mimic.icd.c$Drug.use <- ifelse(str_detect(df.mimic.icd.c$ICD9, paste(Drug.use, collapse = '|')), 1, 0)
+df.mimic.icd.c$Drug.psychosis <- ifelse(str_detect(df.mimic.icd.c$ICD9, paste(Drug.psychosis, collapse = '|')), 1, 0)
+df.mimic.icd.c$Homeless <- ifelse(str_detect(df.mimic.icd.c$ICD9, paste(Homeless, collapse = '|')), 1, 0)
+
+#Create indicator for each algorithm in Ball paper
+df.mimic.icd.c <- df.mimic.icd.c %>%
+  mutate(`Algorithm 6` = ifelse(HIV == 1 | HCV == 1, 1, 0),
+         `Algorithm 7` = ifelse(HIV == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 8` = ifelse(HIV == 1 | Drug.psychosis == 1, 1, 0),
+         `Algorithm 9` = ifelse(HCV == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 10` = ifelse(HCV == 1 | Drug.psychosis == 1, 1, 0),
+         `Algorithm 11` = ifelse(Drug.psychosis == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 12` = ifelse(HIV == 1 | HCV == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 13` = ifelse(HIV == 1 | HCV == 1 | Drug.psychosis == 1, 1, 0),
+         `Algorithm 14` = ifelse(HCV == 1 | Drug.psychosis == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 15` = ifelse(HIV == 1 | HCV == 1 | Drug.psychosis == 1 | Drug.use == 1, 1, 0),
+         `Algorithm 16` = ifelse(HIV == 1 | HCV == 1 | Drug.psychosis == 1 | Drug.use == 1 | Homeless == 1, 1, 0)
+  )
+
+#Join to truth dataset
+df.mimic.ids2 <- df.mimic.neg %>% left_join(df.mimic.ids %>% select(id, SUBJECT_ID), by = c("doc_id" = "id"))
+df.mimic.icd.c <- df.mimic.icd.c %>% left_join(df.mimic.ids2, by = "SUBJECT_ID")
+df.mimic.icd.c <- df.mimic.icd.c %>% filter(!is.na(ivdu))
+df.mimic.icd.c <- df.mimic.icd.c %>% mutate(across(c(HIV:`Algorithm 16`), ~replace_na(., 0)))
+df.mimic.icd.c <- df.mimic.icd.c %>% 
+  mutate(across(`Algorithm 6`:`Algorithm 16`, ~ifelse(. == 1, "IVDU", "Non-IVDU")))
+df.mimic.icd.c <- df.mimic.icd.c %>% 
+  mutate(IVDU2 = as.character(IVDU2))
+#df.mimic.icd.c <- df.mimic.icd.c %>% mutate(across(`Algorithm 6`:`Algorithm 16`, ~ as.factor(.)))
+#df.mimic.icd.c <- df.mimic.icd.c %>% mutate(across(ivdu, ~ as.factor(.)))
+
+#Descriptives
+df.mimic.descriptive <- df.mimic.icd.c %>% 
+  left_join(df.mimic.patient, by = "SUBJECT_ID") %>%
+  select(!c(text, text.neg))
+df.mimic.descriptive <- df.mimic.descriptive %>%
+  left_join(df.mimic.admission %>% distinct(SUBJECT_ID, .keep_all = T), by = c("SUBJECT_ID"))
+
+df.mimic.descriptive %>% count(ETHNICITY)
+
+df.mimic.descriptive <- df.mimic.descriptive %>% 
+  mutate(Age = time_length(difftime(as.Date(ADMITTIME), as.Date(DOB)), "years")) %>%
+  mutate(ETHNICITY.c = case_when(
+  str_detect(ETHNICITY, regex("WHITE", ignore_case=TRUE)) ~ "White",
+  str_detect(ETHNICITY, regex("HISPANIC", ignore_case=TRUE)) ~ "Hispanic/Latino",
+  str_detect(ETHNICITY, regex("BLACK", ignore_case=TRUE)) ~ "Black/African American",
+  str_detect(ETHNICITY, regex("ASIAN", ignore_case=TRUE)) ~ "Asian",
+  str_detect(ETHNICITY, regex("AMERICAN INDIAN/ALASKA NATIVE", ignore_case=TRUE)) ~ "American Indian/Alaska native",
+  TRUE ~ "Other")) %>%
+  mutate(Gender = ifelse(GENDER == "M", "Male", "Female"))
+
+##Make descriptive table
+tbl.mimic.pwid <- df.mimic.descriptive %>% 
+  select(Age, Gender, `Race/Ethnicity` = ETHNICITY.c, IVDU,
+         HIV, HCV, Drug.use, Drug.psychosis, Homeless) %>%
+	tbl_summary(
+		sort = all_categorical() ~ "frequency") %>%
+	#add_overall() %>%
+	#add_p() %>%
+	as_flex_table() %>%
+	set_table_properties(layout = "autofit")
+tbl.mimic.pwid
+
+
+#Evaluate ICD metrics
+ICD.Algorithms <- c("Algorithm 6", "Algorithm 7", "Algorithm 8", "Algorithm 9", "Algorithm 10", 
+                    "Algorithm 11", "Algorithm 12", "Algorithm 13", "Algorithm 14", "Algorithm 15", "Algorithm 16")
+icd.cm <- map(ICD.Algorithms, ~ {
+  evaluate(df.mimic.icd.c,
+           target_col = "IVDU2",
+           prediction_cols = .x,
+           type = "binomial")
+})
+
+#Get table summarising metrics
+ICD.table <- bind_cols(ICD.Algorithms, bind_rows(icd.cm)) %>% rename(Algorithm = ...1)
+ICD.table <- ICD.table %>% mutate(across(where(is.numeric), ~ round(., 3)))
+ft.ICD.table <- flextable(ICD.table %>% select(!c("Prevalence", "Predictions", "ROC", "Confusion Matrix", "Process"))) %>%
+  set_caption("Diagnostic metrics for different algorithsm based on ICD codes in MIMIC dataset") %>%
+  	set_table_properties(layout = "autofit") %>%
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+ft.ICD.table
+
+
+#Set up for ROC plot
+ICD.roc <- map2(1:length(ICD.Algorithms), ICD.Algorithms, ~ {
+  bind_rows(icd.cm[[.x]]$Predictions %>%
+              as.data.frame() %>%
+              mutate(Algorithm = paste(.y)))
+})
+ICD.roc <- bind_rows(ICD.roc)
+ICD.roc$Algorithm <- factor(ICD.roc$Algorithm, 
+                            levels = c( c("Algorithm 6", "Algorithm 7", "Algorithm 8", 
+                                          "Algorithm 9", "Algorithm 10", "Algorithm 11", 
+                                          "Algorithm 12", "Algorithm 13", "Algorithm 14",
+                                          "Algorithm 15", "Algorithm 16")))
+
+#Plot ROC
+p.icd.roc <- ggplot(data = ICD.roc, aes(m = Prediction, d =Target, color = Algorithm)) +
+  plotROC::geom_roc(n.cuts = 20, labels = F, size = 1) + 
+  labs(y = "Sensitivity", x = "1 - Specificity") +
+  theme_minimal()
+p.icd.roc 
+```
+
+```{r Bootstrapping}
+#p_load(furrr)
+#plan(multisession, workers = 8)
+
+#Confidence intervals
+boot_test_icd <- bootstraps(df.mimic.icd.c, times = 1000, apparent = TRUE, strata = IVDU2)
+
+
+bootstrap_metrics <- function(split) {
+  map(ICD.Algorithms, ~ {
+  evaluate(analysis(split),
+           target_col = "IVDU2",
+           prediction_cols = .x,
+           type = "binomial") %>%
+    mutate(algorithm = .x)
+})
+}
+
+boot_icd <- boot_test_icd %>% 
+  mutate(metrics = future_map(splits, bootstrap_metrics, .options = furrr_options(seed = 100)))
+
+
+boot_icd_results <- bind_rows(boot_icd$metrics)
+
+boot_icd_results$algorithm <- factor(boot_icd_results$algorithm,
+                            levels = c( c("Algorithm 6", "Algorithm 7", "Algorithm 8", 
+                                          "Algorithm 9", "Algorithm 10", "Algorithm 11", 
+                                          "Algorithm 12", "Algorithm 13", "Algorithm 14",
+                                          "Algorithm 15", "Algorithm 16")))
+
+bootstrap_icd_CI_results <- boot_icd_results %>% 
+  select(-`Lower CI`, -`Upper CI`, -MCC, -`Detection Rate`, -`Detection Prevalence`, -Prevalence,
+         -Predictions, -ROC, -`Confusion Matrix`, -Process, -`Balanced Accuracy`) %>%
+      group_by(algorithm) %>% 
+  pivot_longer(
+    cols = c(Accuracy:Kappa),
+    names_to = ".metric",
+    values_to = ".estimate"
+  ) %>%
+    group_by(algorithm, .metric) %>% 
+    summarize(mean = mean(.estimate, na.rm = T),
+                                  CI.lower = quantile(.estimate, probs = c(0.025), na.rm = T),
+                                  CI.upper = quantile(.estimate, probs = c(0.975), na.rm = T)
+                                  ) %>%
+    mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+    mutate(outcome = "IVDU", 
+           `95% CI` = paste0(CI.lower, " - ", CI.upper),
+           Metric = case_when(
+ .metric == "F1" ~ "F-score", 
+ .metric == "Accuracy"  ~ "Accuracy",
+ .metric == "Kappa"~ "Kappa",
+ .metric == "Sensitivity" ~ "Sensitivity/Recall",
+ .metric == "Specificity" ~ "Specificity",
+ .metric == "Pos Pred Value" ~ "Positive predictive value/Precision",
+ .metric == "Neg Pred Value" ~ "Negative predictive value",
+ .metric == "AUC" ~ "AUROC"
+))
+
+table.ICD.95CI <- flextable::flextable(bootstrap_icd_CI_results %>% 
+    select(Algorithm = algorithm, Metric, `Mean estimate` = mean, `95% CI`)) %>%
+  set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in Mimic dataset for ICD codes") %>%
+  	set_table_properties(layout = "autofit") %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+table.ICD.95CI
+
+table.ICD.95CI.w <- bootstrap_icd_CI_results %>% 
+  mutate(`Mean\n(95% CI)` = paste0(mean, "\n", "(", `95% CI`, ")")) %>%
+  select(Algorithm = algorithm, Metric, `Mean\n(95% CI)`) %>%
+  pivot_wider(
+    id_cols = Algorithm,
+    names_from = Metric,
+    values_from = `Mean\n(95% CI)`
+  )
+
+
+
+tbl.ICD.95CI.w <- flextable::flextable(table.ICD.95CI.w) %>% 
+      set_caption(caption = "Table. Bootstrapped diagnostic metrics and 95% confidence intervals of best performing models in Mimic for ICD codes") %>%
+  	set_table_properties(layout = "autofit") %>% 
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+tbl.ICD.95CI.w
+```
+
+```{r}
+#Final tables/plots
+tables.list <- list(tbl.mimic.pwid, table.mimic.95CI, tbl.ICD.95CI.w)
+
+#plot.list <- list(p.heat, p.heat2, test_CM_table)
+#p.variable.importance, 
+# write function
+
+p_load(officer, flextable)
+write_word_table <- function(var, doc){
+  doc %>%
+    body_add_flextable(var) %>% 
+    body_add_break() }
+
+write_word_plot <- function(var, doc){
+  doc %>%
+    body_add_gg(var, style = "centered", height = 6, width = 8) %>% 
+    body_end_section_landscape()
+}
+# list of tables and the doc
+my_doc1 <- officer::read_docx()
+
+# use walk (the invisible function of map) to include all tables in one doc
+walk(tables.list, write_word_table, my_doc1) 
+
+#include plots
+write_word_plot(p.mimic.roc.boot, my_doc1)
+write_word_plot(p.mimic.pr.boot, my_doc1) 
+write_word_plot(p.mimic.cm, my_doc1) 
+write_word_plot(p.icd.roc, my_doc1) 
+write_word_plot(p.mimic.roc.boot, my_doc1) 
+write_word_plot(p.mimic.pr.boot, my_doc1) 
+
+#Create word doc
+print(my_doc1, target = paste0("Tables/NLP_MIMIC_sensitivity", Sys.Date(), ".docx")) %>% invisible()
+```
+
+## Sensitivity analysis 2
+
+
+```{r Load entire dataset}
+df.all <- read_csv("P:/ORD_Goodman_201909071D/CSV/df_all_notes.csv")
+
+df.all <- df.all %>% rename(text = ReportText)
+```
+
+```{r Negation}
+p_load(udpipe, qdapRegex)
+
+#Set up negex simple
+#ud_model <- udpipe_download_model(language = "english-ewt")
+ud_model <- "UDPipe/english-ewt-ud-2.5-191206.udpipe"
+udmodel <- udpipe_load_model(ud_model)
+
+load("negex.rdata") 
+    negex_original <- negex
+
+    # We only keep terms indicating negation or pseudonegation Making sure there are no duplicates!
+    negex_short <- negex_original[grepl("Neg", negex_original$CATEGORY, ignore.case = TRUE), ]
+    negex_short <- negex_short[!duplicated(negex_short$ITEM), ]
+
+    # Wrapper for udpipe annotator Makes it easier to use lapply
+    annotator <- function(text, model) {
+
+        output <- udpipe::udpipe_annotate(model, text)
+        output <- as.data.frame(output, detailed = TRUE)$token
+
+        output
+
+    }
+
+    negex_list <- list()
+    negex_list$category <- negex_short$CATEGORY
+    negex_list$item <- lapply(negex_short$ITEM, annotator, udmodel)
+    negex_list$closure <- negex_short$CLOSURE
+
+    negex_simp <- data.frame(item = negex_short$ITEM, category = negex_short$CATEGORY, closure = negex_short$CLOSURE)
+    negex_simp$closure <- as.character(negex_simp$closure)
+    negex_simp$closure[is.na(negex_simp$closure)] <- "none"
+    negex_simp$item <- as.character(negex_simp$item)
+
+    negex_simp$n_grams_length <- NA
+    for (i in 1:length(negex_simp[, 1])) negex_simp$n_grams_length[i] <- length(negex_list$item[[i]])
+```
+
+```{r Set up negex functions from CEDERS}
+#' Annotate for Negation
+#'
+#' Annotates EHR text for negation, based on Negex, as simple medical negation lexicon. Tokens are labelled by proximity. The original paper went up to 6 tokens before or after negation.
+#' @param annotated_text Dataframe of NLP annotations.
+#' @param negex_simp Dataframe of simplified negex.
+#' @param negex_depth Maximum distance between word to label and negation term, before or after. Default is 6, as per original paper by Chapman et al.
+#' @return Dataframe with added negation information.
+#' @keywords internal
+
+negex_processor <- function(annotated_text, negex_simp, negex_depth = 6) {
+
+    negex_simp$item <- as.character(negex_simp$item)
+    annotated_text$token <- as.character(annotated_text$token)
+
+    i <- 2
+
+    annotated_text$tolower_token <- tolower(annotated_text$token)
+    annotated_text <- merge(annotated_text, subset(negex_simp, n_grams_length = 1, select = c("item", "category",
+        "closure")), by.x = "tolower_token", by.y = "item", all.x = TRUE, all.y = FALSE)
+    annotated_text$negex_end <- NA
+    annotated_text$negex_end[!is.na(annotated_text$category) | !is.na(annotated_text$closure)] <- annotated_text$token_id[!is.na(annotated_text$category) |
+        !is.na(annotated_text$closure)]
+    colnames(annotated_text) <- gsub("category", "negex_category", colnames(annotated_text))
+    colnames(annotated_text) <- gsub("closure", "negex_closure", colnames(annotated_text))
+
+    max_n_grams_length <- max(negex_simp$n_grams_length)
+
+    while (i <= max_n_grams_length) {
+        annotated_text <- annotated_text[order(annotated_text$paragraph_id, annotated_text$sentence_id, annotated_text$start,
+            decreasing = FALSE, method = "radix"), ]
+        annotated_text$grams <- udpipe::txt_nextgram(annotated_text$tolower_token, n = i, sep = " ")
+        annotated_text <- merge(annotated_text, subset(negex_simp, n_grams_length = i, select = c("item", "category",
+            "closure")), by.x = "grams", by.y = "item", all.x = TRUE, all.y = FALSE)
+        annotated_text$negex_category[!is.na(annotated_text$category) | !is.na(annotated_text$closure)] <- annotated_text$category[!is.na(annotated_text$category) |
+            !is.na(annotated_text$closure)]
+        annotated_text$negex_closure[!is.na(annotated_text$category) | !is.na(annotated_text$closure)] <- annotated_text$closure[!is.na(annotated_text$category) |
+            !is.na(annotated_text$closure)]
+        annotated_text <- annotated_text[order(annotated_text$paragraph_id, annotated_text$sentence_id, annotated_text$start,
+            decreasing = FALSE, method = "radix"), ]
+        annotated_text$negex_end[!is.na(annotated_text$category) | !is.na(annotated_text$closure)] <- annotated_text$token_id[(1:length(annotated_text[,
+            1]))[!is.na(annotated_text$category) | !is.na(annotated_text$closure)] + i - 1]
+        # We overwrite older phrases included in newer, larger ones
+        temp <- list()
+        for (j in (1:length(annotated_text[, 1]))[!is.na(annotated_text$category) | !is.na(annotated_text$closure)]) temp[[j]] <- j +
+            (1:(i - 1))
+        temp <- unlist(temp)
+        annotated_text$negex_category[temp] <- NA
+        annotated_text$negex_closure[temp] <- NA
+        annotated_text$negex_end[temp] <- NA
+        annotated_text$category <- NULL
+        annotated_text$closure <- NULL
+        i <- i + 1
+    }
+
+    annotated_text$grams <- NULL
+    annotated_text$tolower_token <- NULL
+
+    if (any(!is.na(annotated_text$negex_category)))
+        annotated_text <- negation_tagger(annotated_text, negex_depth) else annotated_text$negated <- rep(FALSE, length(annotated_text[, 1]))
+
+    annotated_text <- annotated_text[order(annotated_text$paragraph_id, annotated_text$sentence_id, annotated_text$start,
+        decreasing = FALSE, method = "radix"), ]
+
+    annotated_text
+
+}
+
+
+#' Tag for Negation
+#'
+#' Processes and NLP annotation dataframe and tags negated words based on distance from negation item.
+#' @param annotated_text Dataframe of NLP annotations.
+#' @param negex_depth Maximum distance between word to label and negation term, before or after. Default is 6, as per original paper by Chapman et al.
+#' @return Dataframe with added negation information.
+#' @keywords internal
+
+negation_tagger <- function(annotated_text, negex_depth) {
+
+    work_df <- subset(annotated_text, !is.na(negex_category), select = c("paragraph_id", "sentence_id", "token_id",
+        "negex_category", "negex_end"))
+
+    work_df$token_id <- lapply(1:length(work_df[, 1]), negex_token_tagger, work_df, negex_depth)
+
+    work_df$paragraph_id <- lapply(1:length(work_df[, 1]), id_expander, work_df, "paragraph_id")
+
+    work_df$sentence_id <- lapply(1:length(work_df[, 1]), id_expander, work_df, "sentence_id")
+
+    work_df <- data.frame(paragraph_id = unlist(work_df$paragraph_id), sentence_id = unlist(work_df$sentence_id),
+        token_id = unlist(work_df$token_id))
+    work_df$negated <- TRUE
+    work_df <- work_df[!duplicated(work_df), ]
+
+    annotated_text <- merge(annotated_text, work_df, by = c("paragraph_id", "sentence_id", "token_id"), all.x = TRUE,
+        all.y = FALSE)
+    annotated_text$negated[is.na(annotated_text$negated)] <- FALSE
+
+    annotated_text
+
+}
+
+
+#' Compute Token Series
+#'
+#' Computes negated token series as a function of index, i.e. position of negation item.
+#' @param index Position of negation item.
+#' @param work_df Working dataframe of NLP annotations.
+#' @param negex_depth Maximum distance from index to which negation will spread.
+#' @return Series of token positions within the working dataframe.
+#' @keywords internal
+
+negex_token_tagger <- function(index, work_df, negex_depth) {
+
+    before <- as.numeric(as.character(work_df[index, ]$token))
+    after <- as.numeric(as.character(work_df[index, ]$negex_end))
+
+    # Getting negated token series
+    before <- (before - negex_depth):(before - 1)
+    after <- (after + 1):(after + negex_depth)
+
+    out <- c(before, after)
+
+    out
+
+}
+
+
+#' Expand ID's
+#'
+#' Duplicates paragraph or sentence ID's to help process negation based on negated token series.
+#' @param index Row position within annotations dataframe.
+#' @param work_df Working annotations dataframe.
+#' @param field Field to duplicate.
+#' @return Series of duplicated field values.
+#' @keywords internal
+
+id_expander <- function(index, work_df, field) {
+
+    column <- which(colnames(work_df) == field)
+    out <- as.numeric(as.character(work_df[index, column]))
+
+    out <- rep(out, length(work_df[index, ]$token_id[[1]]))
+
+}
+```
+
+```{r}
+#Annotate text using udpipe
+df.all$doc_id <- as.character(df.all$TIUDocumentSID)
+df.all$text <- as.character(df.all$ReportText)
+
+annotated_text <- map(1:nrow(df.all), ~ {
+  udpipe::udpipe_annotate(udmodel, x = df.all[.x,]$text, doc_id = df.all[.x, ]$doc_id,
+                                          tokenizer = "tokenizer", tagger = "default",
+                                          parser = "default") %>%
+    as.data.frame(., detailed = TRUE)
+}
+)
+
+#Use negex to tag negated toxens
+negex.list <- map(annotated_text, ~{
+  negex_processor(.x, negex_simp, 6)
+}
+)
+
+#Remove negated tokens 
+negex.remove <- map(negex.list, ~{
+  .x %>% 
+    filter(negated == FALSE) %>%
+    filter(!negex_category %in% c("definiteNegatedExistence", "probableNegatedExistence")) %>%
+    group_by(doc_id) %>% 
+    summarise(text.neg = paste0(token, collapse = " ")) 
+})
+
+df.neg <- bind_rows(negex.remove)
+
+df.all.neg <- df.all %>% left_join(df.neg, by = "doc_id")
+saveRDS(df.all.neg, "Data/df_all_neg.rds")
+```
+
+```{r String replace}
+df.all.neg <- df.all.neg %>%
+    mutate(text.neg = str_replace_all(text.neg, pattern = regex("intravenous drug use", ignore_case = T),  replacement = "IVDU")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("intravenous drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("IV drug use", ignore_case = T), replacement = "IVDU")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("IV drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("injection drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("injection drug use", ignore_case = T), replacement = "IVDU"))
+  
+```
+
+```{r Predict on entire dataset}
+#grid_results <- readRDS("Output/grid_results_2022-03-28tfidf+neg+reg.RDS")
+test_results <- readRDS("Output/test_results2022-03-28_tfidf+neg+regex.rds")
+test_fitted <- test_results$.workflow[[1]]
+
+df.predicted <- bind_cols(df.all.neg, 
+          predict(test_fitted, new_data = df.all.neg, type = "class"),
+          predict(test_fitted, new_data = df.all.neg, type = "prob"))
+saveRDS(df.predicted, "Data/df_all_predicted.rds")
+
+saveRDS(df.predicted %>% filter(.pred_class == "IVDU") %>% arrange(desc(.pred_IVDU)), "Data/df_all_predicted_ivdu.rds")
+```
+
+```{r Wrangle for epi analysis}
+df.predicted <- readRDS( "Data/df_all_predicted.rds")
+
+#Keep only distinct records
+df.predicted.d <- df.predicted %>% 
+  distinct(PatientSID, .keep_all = T)
+
+#Load ICD data
+df.diagnosis.m1 <- readRDS("Data/df_ICD_all.rds")
+
+#Load descriptive data
+df.descriptive <- readRDS("Data/df_descriptive.rds")
+
+#Join ICD df to Predicted df
+df.predicted.icd <- df.diagnosis.m1 %>% 
+  left_join(df.predicted.d)
+
+#Join descriptive Df
+df.predicted.icd <- df.predicted.icd %>% 
+  left_join(df.descriptive %>% 
+              select(-"Acute_AdmitDateTime", -"Acute_DischargeDateTime"))
+
+skim(df.predicted.icd)
+
+#Select best performing ICD algorithm and name as ICD
+df.predicted.icd <- df.predicted.icd %>%
+  mutate(ICD = ifelse(`Algorithm 10` == 1, "IVDU", "Non-IVDU"))
+
+#Parse dates
+df.predicted.icd <- df.predicted.icd %>%
+  filter(!is.na(.pred_class)) %>%
+  mutate(Year = year(SpecimenTakenDateTime)) %>%
+  mutate(Month = month(SpecimenTakenDateTime)) %>%
+  mutate(Month.Year = quarter(SpecimenTakenDateTime, with_year = T))
+  #mutate(Month.Year = format_ISO8601(SpecimenTakenDateTime, precision = "ym"))
+
+#Make venn diagram of overlap of predicted vs ICD
+p_load(ggvenn)
+
+df.predicted.venn <- df.predicted.icd %>%
+  select(.pred_class, ICD) %>%
+  mutate(.pred_class = ifelse(.pred_class == "IVDU", T, F),
+         ICD = ifelse(ICD == "IVDU", T, F)) %>%
+  as_tibble()
+
+#Set up enrollee data
+Year = c(2003:2014)
+enrollee = c(7186643, 7419851, 7655562, 7872438,7833445, 7834763, 8048560,8343117,8574198, 8762548, 8926546,9111955)
+df.enrollee <- data.frame(Year, enrollee)
+
+```
+
+```{r Plot - National by quarter}
+#Create scatterplot plot by month
+df.month.predicted <- df.predicted.icd %>% 
+  group_by(Month.Year) %>%
+  count(.pred_class) %>%
+  mutate(Method = "NLP")
+df.month.icd <- df.predicted.icd %>% 
+  group_by(Month.Year) %>%
+  count(ICD) %>%
+  mutate(Method = "ICD")
+df.month <- bind_rows(df.month.predicted, df.month.icd)
+df.month <- df.month %>%
+  mutate(Year = str_extract(Month.Year, "[^.]+"),
+         Year = as.numeric(Year)) %>%
+  left_join(df.enrollee, by = "Year") 
+df.month <- df.month %>% 
+  mutate(Rate = n/enrollee * 100000)
+
+ggplot(data = df.month %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Month.Year), y = n, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  scale_y_continuous(limits = c(0,200), breaks = c(0,50,100,150,200)) +
+  labs(x = "Year-Quarter", y = "Estimated number of PWID cases") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+        text = element_text(size = 14))
+
+ggsave("Plots/national_quarter_cases.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/national_quarter_cases.pdf", dpi = 300, height = 8, width = 10)
+
+ggplot(data = df.month %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Month.Year), y = Rate, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  labs(x = "Year-Quarter", y = "Estimated rate per 100,000") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+        text = element_text(size = 14))
+
+ggsave("Plots/national_quarter_rate.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/national_quarter_rate.pdf", dpi = 300, height = 8, width = 10)
+```
+
+```{r National by year}
+#Create scatterplot plot by year
+df.year.predicted <- df.predicted.icd %>% 
+  group_by(Year) %>%
+  count(.pred_class) %>%
+  mutate(Method = "NLP")
+df.year.icd <- df.predicted.icd %>% 
+  group_by(Year) %>%
+  count(ICD) %>%
+  mutate(Method = "ICD")
+df.year <- bind_rows(df.year.predicted, df.year.icd)
+df.year <- df.year %>% left_join(df.enrollee, by = "Year")
+df.year <- df.year %>%
+  mutate(Rate = n/enrollee * 100000)
+
+##Number of cases
+ggplot(data = df.year %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Year), y = n, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+    scale_y_continuous(limits = c(0,700), breaks = seq(0,700, by = 100)) +
+  labs(x = "Year", y = "Estimated number of cases") +
+  theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1),
+        text = element_text(size = 14))
+
+ggsave("Plots/national_year_cases.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/national_year_cases.pdf", dpi = 300, height = 8, width = 10)
+
+##Estimated rate cases per 100,000
+ggplot(data = df.year %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Year), y = Rate, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  scale_y_continuous(limits = c(0,10), breaks = seq(0,10, by = 2)) +
+  labs(x = "Year", y = "Estimated rate per 100,000") +
+  theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1),
+        text = element_text(size = 14))
+
+ggsave("Plots/national_year_rate.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/national_year_rate.pdf", dpi = 300, height = 8, width = 10)
+
+
+#Calculate rates
+tidy(lm(data = df.year %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+   formula = Rate ~ Year + Method))
+
+df.year %>% 
+  filter(ICD == "IVDU" | .pred_class == "IVDU") %>%
+  group_by(Method) %>%
+  summarise(Mean = mean(Rate), SD = sd(Rate))
+
+
+```
+
+```{r District plots}
+#Create scatterplot plot by quarter
+df.month.d.predicted <- df.predicted.icd %>% 
+  group_by(District, Month.Year) %>%
+  count(.pred_class) %>%
+  mutate(Method = "NLP")
+df.month.d.icd <- df.predicted.icd %>% 
+  group_by(District, Month.Year) %>%
+  count(ICD) %>%
+  mutate(Method = "ICD")
+df.month.d <- bind_rows(df.month.d.predicted, df.month.d.icd)
+
+df.month.d <- df.month.d %>%
+  mutate(Year = str_extract(Month.Year, "[^.]+"),
+         Year = as.numeric(Year)) %>%
+  left_join(df.enrollee, by = "Year") 
+df.month.d <- df.month.d %>% 
+  mutate(Rate = n/enrollee * 100000)
+
+p.quarter.district <- ggplot(data = df.month.d %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Month.Year), y = n, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  labs(x = "Year-Quarter", y = "Estimated number of Cases") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+        text = element_text(size = 14)) +
+  facet_wrap(~District)
+p.quarter.district
+
+ggsave("Plots/district_quarter_cases.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/district_quarter_cases.pdf", dpi = 300, height = 8, width = 10)
+
+p.quarter.district.rate <- ggplot(data = df.month.d %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Month.Year), y = Rate, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  labs(x = "Year-Quarter", y = "Estimated rate per 100,000") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+        text = element_text(size = 14)) +
+  facet_wrap(~District)
+p.quarter.district.rate
+
+ggsave("Plots/district_quarter_rate.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/district_quarter_rate.pdf", dpi = 300, height = 8, width = 10)
+```
+
+```{r District rates}
+#Create scatterplot plot by year
+df.year.d.predicted <- df.predicted.icd %>% 
+  group_by(District, Year) %>%
+  count(.pred_class) %>%
+  mutate(Method = "NLP")
+df.year.d.icd <- df.predicted.icd %>% 
+  group_by(District, Year) %>%
+  count(ICD) %>%
+  mutate(Method = "ICD")
+df.year.d <- bind_rows(df.year.d.predicted, df.year.d.icd)
+df.year.d <- df.year.d %>% left_join(df.enrollee, by = "Year")
+df.year.d <- df.year.d %>%
+  mutate(Rate = n/enrollee * 100000)
+
+p.year.district <- ggplot(data = df.year.d %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Year), y = n, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  scale_y_continuous(limits = c(0,200), breaks = seq(0,200, by = 50)) +
+  labs(x = "Year", y = "Estimated number of cases") +
+  theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1),
+        text = element_text(size = 14)) +
+  facet_wrap(~District)
+p.year.district 
+
+ggsave("Plots/district_year_cases.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/district_year_cases.pdf", dpi = 300, height = 8, width = 10)
+
+p.year.district.rate <- ggplot(data = df.year.d %>% filter(ICD == "IVDU" | .pred_class == "IVDU"), 
+             aes(x = as.factor(Year), y = Rate, shape = Method, color = Method)) +
+  geom_point(size = 3) +
+  scale_color_discrete_qualitative(palette = "Dark 3") + 
+  scale_y_continuous(limits = c(0,3), breaks = seq(0,3, by = 1)) +
+  labs(x = "Year", y = "Estimated rate per 100,000") +
+  theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1),
+        text = element_text(size = 14)) +
+  facet_wrap(~District)
+p.year.district.rate 
+
+ggsave("Plots/district_year_rate.png", dpi = 300, height = 8, width = 10)
+ggsave("Plots/district_year_rate.pdf", dpi = 300, height = 8, width = 10)
+```
+
+```{r Butcher - Annonyimze}
+test_fitted <- test_results$.workflow[[1]]
+
+test_fitted$pre$actions$recipe$recipe$template$text.neg <- "NULL"
+
+saveRDS(test_fitted, "Output/fit_model_predict.rds")
+```
+
+```{r Session Info}
+sessioninfo::session_info(to_file = "session.log")
+```

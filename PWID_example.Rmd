@@ -1,0 +1,136 @@
+```{r}
+#install.packages("pacman")
+library(pacman)
+
+p_load(tidyverse, tidylog, purrr, tidymodels, tidytext, textrecipes, textclean, stringr, tokenizers, workflowsets, themis)
+
+source("negex.R") #Load functions for negex to work
+```
+
+### 3 step process
+1. Run negex to remove negated terms in text
+2. Use regex to simplify some termes related to people who inject drugs
+3. Use ML model to predict classification as PWID or NOT PWID
+
+Need to have a dataframe with an ID for each text, and of course, the text. 
+The dataframe should be called "df".
+The IDs should be in a column "doc_id".
+The text to be classified should be in a column "text". 
+ 
+Below you can run the process individually, or go to the 5th chunk and run the code in one go.  
+
+```{r Negex}
+df <- data.frame(doc_id = c("1", "2", "3"),
+                 text = c("57 y/o male report IVDU, heroin and methamphetamine use", 
+                          "57 y/o male report IVDU, heroin and methamphetamine use",
+                          "57 y/o female denies smoking, alcohol or injection drug use. Has been sober and on methadone for 12 years."))
+
+#Annotate text using udpipe
+annotated_text <- map(1:nrow(df), ~ {
+  udpipe::udpipe_annotate(udmodel, x = df[.x,]$text, doc_id = df[.x, ]$doc_id,
+                                          tokenizer = "tokenizer", tagger = "default",
+                                          parser = "default") %>%
+    as.data.frame(., detailed = TRUE)
+}
+)
+
+#Use negex to tag negated toxens
+negex.list <- map(annotated_text, ~{
+  negex_processor(.x, negex_simp, 6)
+}
+)
+
+#Remove negated tokens 
+negex.remove <- map(negex.list, ~{
+  .x %>% 
+    filter(negated == FALSE) %>%
+    filter(!negex_category %in% c("definiteNegatedExistence", "probableNegatedExistence")) %>%
+    group_by(doc_id) %>% 
+    summarise(text.neg = paste0(token, collapse = " ")) 
+})
+
+df.neg <- bind_rows(negex.remove)
+
+df <- df %>% left_join(df.neg, by = "doc_id")
+```
+
+```{r Regex}
+df <- df %>%
+    mutate(text.neg = str_replace_all(text.neg, pattern = regex("intravenous drug use", ignore_case = T),  replacement = "IVDU")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("intravenous drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("IV drug use", ignore_case = T), replacement = "IVDU")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("IV drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("injection drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("injection drug use", ignore_case = T), replacement = "IVDU"))
+
+#write_rds(df, "Data/df_example.rds")  
+```
+
+```{r ML to predict}
+#Import example data
+df <- read_rds("Data/df_example.rds")
+
+#Import model for prediction
+test_fitted <- readRDS("Output/fit_model_predict.rds")
+
+#Predict on new data
+df.predicted <- bind_cols(df, 
+          predict(test_fitted, new_data = df, type = "class"),
+          predict(test_fitted, new_data = df, type = "prob"))
+```
+
+```{r All in one go}
+df <- data.frame(doc_id = c("1", "2", "3"),
+                 text = c("57 y/o male report IVDU, heroin and methamphetamine use", 
+                          "57 y/o male report IVDU, heroin and methamphetamine use",
+                          "57 y/o female denies smoking, alcohol or injection drug use. Has been sober and on methadone for 12 years."))
+
+#Annotate text using udpipe
+annotated_text <- map(1:nrow(df), ~ {
+  udpipe::udpipe_annotate(udmodel, x = df[.x,]$text, doc_id = df[.x, ]$doc_id,
+                                          tokenizer = "tokenizer", tagger = "default",
+                                          parser = "default") %>%
+    as.data.frame(., detailed = TRUE)
+}
+)
+
+#Use negex to tag negated toxens
+negex.list <- map(annotated_text, ~{
+  negex_processor(.x, negex_simp, 6)
+}
+)
+
+#Remove negated tokens 
+negex.remove <- map(negex.list, ~{
+  .x %>% 
+    filter(negated == FALSE) %>%
+    filter(!negex_category %in% c("definiteNegatedExistence", "probableNegatedExistence")) %>%
+    group_by(doc_id) %>% 
+    summarise(text.neg = paste0(token, collapse = " ")) 
+})
+df.neg <- bind_rows(negex.remove)
+
+#Join back to original DF
+df <- df %>% left_join(df.neg, by = "doc_id")
+
+#Regex
+df <- df %>%
+    mutate(text.neg = str_replace_all(text.neg, pattern = regex("intravenous drug use", ignore_case = T),  replacement = "IVDU")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("intravenous drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("IV drug use", ignore_case = T), replacement = "IVDU")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("IV drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("injection drug abuse", ignore_case = T), replacement = "IVDA")) %>%
+  mutate(text.neg = str_replace_all(text.neg, pattern = regex("injection drug use", ignore_case = T), replacement = "IVDU"))
+
+#Import model for prediction
+test_fitted <- readRDS("Output/fit_model_predict.rds")
+
+#Predict on new data
+df.predicted <- bind_cols(df, 
+          predict(test_fitted, new_data = df, type = "class"),
+          predict(test_fitted, new_data = df, type = "prob"))
+```
+
+```{r}
+sessionInfo()
+```
